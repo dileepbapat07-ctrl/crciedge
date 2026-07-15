@@ -354,7 +354,7 @@ elif page == "🎯 Decision engine":
             ],
             "Weight": ["22%","14%","10%","10%","10%","8%"]
         })
-        st.dataframe(factors_df, use_container_width=True, hide_index=True)
+        st.dataframe(factors_df, width="stretch", hide_index=True)
 
 # ══════════════════════════════════════════════════════════════════════════
 # PAGE: OVER/UNDER TOTALS
@@ -412,7 +412,7 @@ elif page == "📊 Over/Under totals":
             ORDER BY matches_played DESC LIMIT 1
         """, (sm["venue_id"],
               sm["format"],
-              "T20" if sm["format"] == "T20I" else sm["format"])).fetchone()
+              "T20" if sm["format"] in ("T20I","T20") else sm["format"])).fetchone()
 
         # Show venue baseline
         if vs_row and vs_row["avg_first_innings"]:
@@ -544,7 +544,7 @@ elif page == "📊 Over/Under totals":
                 })
             if ev_data:
                 st.dataframe(pd.DataFrame(ev_data),
-                             use_container_width=True, hide_index=True)
+                             width="stretch", hide_index=True)
 
             st.divider()
 
@@ -629,7 +629,7 @@ elif page == "📈 Bankroll tracker":
                    tickformat="€,.0f"),
         margin=dict(l=0, r=0, t=20, b=0)
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
     # Monthly breakdown
     st.subheader("Monthly breakdown")
@@ -647,7 +647,7 @@ elif page == "📈 Bankroll tracker":
     mo_df["Start"] = mo_df["Start"].apply(lambda x: f"€{x:,}")
     mo_df["End"]   = mo_df["End"].apply(lambda x: f"€{x:,}")
     mo_df["Profit"]= mo_df["Profit"].apply(lambda x: f"+€{x:,}")
-    st.dataframe(mo_df, use_container_width=True, hide_index=True)
+    st.dataframe(mo_df, width="stretch", hide_index=True)
 
     # Milestones
     st.subheader("Key milestones")
@@ -664,7 +664,7 @@ elif page == "📈 Bankroll tracker":
                          columns=["Target","Step","Date","Match"])
     ms_df["Target"] = ms_df["Target"].apply(lambda x: f"€{x:,}")
     reached = bankroll >= 5000
-    st.dataframe(ms_df, use_container_width=True, hide_index=True)
+    st.dataframe(ms_df, width="stretch", hide_index=True)
 
 # ══════════════════════════════════════════════════════════════════════════
 # PAGE: ELO RATINGS
@@ -704,7 +704,7 @@ elif page == "🧬 ELO ratings":
                 "last_match_date":"Last Match","last_result":"Last Result"
             })
             df = df[["Team","ELO Rating","Win %","Wins","Losses","Played","Peak","Last Match"]]
-            st.dataframe(df, use_container_width=True, hide_index=True,
+            st.dataframe(df, width="stretch", hide_index=True,
                         column_config={
                             "ELO Rating": st.column_config.ProgressColumn(
                                 "ELO Rating", min_value=1200, max_value=1900, format="%.0f"
@@ -811,7 +811,7 @@ elif page == "🧬 ELO ratings":
                 "current_winner":"Streak Leader","current_streak":"Streak",
                 "last_match_date":"Last Match"
             })
-            st.dataframe(hdf, use_container_width=True, hide_index=True)
+            st.dataframe(hdf, width="stretch", hide_index=True)
             st.caption(f"{len(h2h_rows)} matchup records")
         else:
             st.info("No H2H data found for this format.")
@@ -949,7 +949,7 @@ elif page == "📋 Match schedule":
     })
     page_df = page_df[["Step","Date","Team A","Team B","Match","Format","Category","Phase","City"]]
 
-    st.dataframe(page_df, use_container_width=True, hide_index=True,
+    st.dataframe(page_df, width="stretch", hide_index=True,
                  column_config={
                      "Step": st.column_config.NumberColumn("Step", width="small"),
                      "Phase": st.column_config.NumberColumn("Phase", width="small"),
@@ -1279,7 +1279,7 @@ elif page == "✏️ Log result":
         hdf = hdf[["step","bet_date","Match","label","stake",
                    "odds_taken","outcome","P&L","Bankroll after","notes"]]
         hdf.columns = ["Step","Date","Match","Label","Stake","Odds","Result","P&L","Bankroll","Notes"]
-        st.dataframe(hdf, use_container_width=True, hide_index=True)
+        st.dataframe(hdf, width="stretch", hide_index=True)
 
         # Summary
         wins_  = sum(1 for h in history if h["outcome"] == "win")
