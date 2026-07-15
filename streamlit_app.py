@@ -147,6 +147,7 @@ with st.sidebar:
         "🧬 ELO ratings",
         "🛡 Risk framework",
         "📋 Match schedule",
+        "✏️ Log result",
     ])
     st.divider()
     st.caption(f"Step {st.session_state.step}/193 · Phase {phase}")
@@ -758,3 +759,267 @@ elif page == "📋 Match schedule":
             st.rerun()
 
     st.caption(f"Page {pg} of {total_pages}")
+
+# ══════════════════════════════════════════════════════════════════════════
+# PAGE: LOG RESULT
+# ══════════════════════════════════════════════════════════════════════════
+elif page == "✏️ Log result":
+    st.title("✏️ Log match result")
+    st.markdown("Update the outcome of a bet and automatically update ELO ratings and bankroll.")
+    st.divider()
+
+    conn = get_db()
+
+    # ── Section 1: Log bet outcome ─────────────────────────────────────
+    st.subheader("1. Record bet outcome")
+
+    # Get upcoming/recent matches that haven't been logged yet
+    logged_ids = [r["match_id"] for r in
+                  conn.execute("SELECT DISTINCT match_id FROM bet_log").fetchall()]
+
+    all_matches = conn.execute("""
+        SELECT match_id, date, step, label, team_a, team_b, format, category
+        FROM matches
+        ORDER BY date DESC, step DESC
+        LIMIT 50
+    """).fetchall()
+
+    # Show all recent matches for selection
+    match_options = {
+        f"Step {m['step']} | {m['date']} | {m['team_a']} vs {m['team_b']} ({m['label']})": dict(m)
+        for m in all_matches
+    }
+
+    selected_label = st.selectbox("Select match", list(match_options.keys()))
+    selected_match = match_options[selected_label]
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        outcome = st.radio("Result", ["win", "loss", "void"],
+                           format_func=lambda x: {"win":"✅ Win","loss":"❌ Loss","void":"⬜ Void/NR"}[x])
+    with col2:
+        odds_taken = st.number_input("Odds taken", min_value=1.01, max_value=20.0,
+                                     value=2.08, step=0.01, format="%.2f")
+    with col3:
+        stake_placed = st.number_input("Stake placed (€)", min_value=0.0,
+                                       max_value=float(bankroll),
+                                       value=round(bankroll * 0.033, 2),
+                                       step=1.0, format="%.2f")
+
+    # Calculate P&L
+    if outcome == "win":
+        pnl = round(stake_placed * (odds_taken - 1), 2)
+    elif outcome == "loss":
+        pnl = -stake_placed
+    else:
+        pnl = 0.0
+
+    bk_after = round(bankroll + pnl, 2)
+
+    # Show preview
+    col1, col2, col3 = st.columns(3)
+    col1.metric("P&L", f"€{pnl:+,.2f}",
+                delta_color="normal" if pnl >= 0 else "inverse")
+    col2.metric("Bankroll after", f"€{bk_after:,.2f}")
+    col3.metric("Step", f"{selected_match['step']}/193")
+
+    notes = st.text_input("Notes (optional)", placeholder="e.g. India won by 6 wickets")
+
+    if st.button("💾 Save bet result", type="primary"):
+        try:
+            conn.execute("""
+                INSERT INTO bet_log
+                (match_id, bet_date, step, phase, bankroll_before,
+                 stake, odds_taken, outcome, profit_loss, bankroll_after, notes)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            """, (
+                selected_match["match_id"],
+                selected_match["date"],
+                selected_match["step"],
+                selected_match.get("phase", 1),
+                bankroll,
+                stake_placed,
+                odds_taken,
+                outcome,
+                pnl,
+                bk_after,
+                notes
+            ))
+
+            # Update bankroll tracker
+            conn.execute("""
+                INSERT OR REPLACE INTO bankroll
+                (date, step, phase, opening_balance, closing_balance,
+                 bets_placed, daily_pnl, cumulative_pnl)
+                VALUES (?,?,?,?,?,1,?,?)
+            """, (
+                selected_match["date"],
+                selected_match["step"],
+                selected_match.get("phase", 1),
+                bankroll,
+                bk_after,
+                pnl,
+                pnl
+            ))
+
+            conn.commit()
+
+            # Update session bankroll
+            st.session_state.bankroll = bk_after
+            st.session_state.step = selected_match["step"] + 1
+
+            if outcome == "win":
+                st.success(f"✅ Recorded! Bankroll updated: €{bankroll:,.2f} → €{bk_after:,.2f} (+€{pnl:,.2f})")
+            elif outcome == "loss":
+                st.error(f"❌ Recorded. Bankroll updated: €{bankroll:,.2f} → €{bk_after:,.2f} (€{pnl:,.2f})")
+            else:
+                st.info(f"⬜ Void recorded. Bankroll unchanged at €{bankroll:,.2f}")
+
+        except Exception as e:
+            st.error(f"Error saving: {e}")
+
+    st.divider()
+
+    # ── Section 2: Update ELO after match ─────────────────────────────
+    st.subheader("2. Update ELO ratings")
+    st.markdown("After logging the bet, also update ELO so future decisions use fresh ratings.")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        elo_team_a = st.text_input("Team A", value=selected_match.get("team_a","India"))
+        elo_team_b = st.text_input("Team B", value=selected_match.get("team_b","England"))
+        elo_winner = st.selectbox("Winner",
+            [elo_team_a, elo_team_b, "no_result"],
+            format_func=lambda x: x if x != "no_result" else "No result / Abandoned")
+    with col2:
+        elo_format = st.selectbox("Format ",
+            ["ODI","T20I","T20","Test"],
+            index=["ODI","T20I","T20","Test"].index(
+                selected_match.get("format","ODI")
+                if selected_match.get("format","ODI") in ["ODI","T20I","T20","Test"]
+                else "ODI"))
+        elo_gender = st.radio("Gender ", ["male","female"], horizontal=True,
+                              format_func=lambda x: "Men's" if x=="male" else "Women's")
+        elo_venue  = st.text_input("Venue country",
+                                   value=selected_match.get("city","England"))
+        elo_mtype  = st.selectbox("Match type",
+                                  ["bilateral","icc_event","domestic"])
+
+    # Show current ELO before update
+    ra_cur = get_elo(elo_team_a, elo_gender, elo_format)
+    rb_cur = get_elo(elo_team_b, elo_gender, elo_format)
+    col1, col2 = st.columns(2)
+    col1.metric(f"{elo_team_a} current ELO", f"{ra_cur:.0f}")
+    col2.metric(f"{elo_team_b} current ELO", f"{rb_cur:.0f}")
+
+    if st.button("🔄 Update ELO ratings", type="secondary"):
+        try:
+            from elo_config import k_factor as kf_func, TEAM_NAME_MAP, HOME_COUNTRY_MAP
+
+            def norm_t(t): return TEAM_NAME_MAP.get(t.strip(), t.strip())
+
+            ta = norm_t(elo_team_a)
+            tb = norm_t(elo_team_b)
+            winner = norm_t(elo_winner) if elo_winner not in ("no_result",) else "no_result"
+
+            # Home detection
+            home = None
+            for team, countries in HOME_COUNTRY_MAP.items():
+                nt = TEAM_NAME_MAP.get(team, team)
+                if elo_venue in countries:
+                    if nt == ta: home = ta
+                    elif nt == tb: home = tb
+                    break
+
+            k = kf_func(elo_mtype, ta, tb)
+            ea = elo_win_prob(ra_cur, rb_cur, home, ta)
+            eb = 1 - ea
+
+            sa = 1.0 if winner == ta else 0.0 if winner != "no_result" else ea
+            sb = 1.0 if winner == tb else 0.0 if winner != "no_result" else eb
+
+            ra_new = round(ra_cur + k * (sa - ea), 2)
+            rb_new = round(rb_cur + k * (sb - eb), 2)
+
+            now = datetime.now().isoformat()
+            match_date = selected_match["date"]
+
+            for team, r_old, r_new, opp, exp, s in [
+                (ta, ra_cur, ra_new, tb, ea, sa),
+                (tb, rb_cur, rb_new, ta, eb, sb)
+            ]:
+                result = "win" if s == 1.0 else "loss" if s == 0.0 else "nr"
+                from INTERNATIONAL_TEAMS import INTERNATIONAL_TEAMS
+                team_type = "international" if team in INTERNATIONAL_TEAMS else "franchise"
+
+                row = conn.execute("""
+                    SELECT peak_rating, matches_played, wins, losses
+                    FROM elo_ratings WHERE team_id=? AND gender=? AND format=?
+                """, (team, elo_gender, elo_format)).fetchone()
+
+                peak   = max(row["peak_rating"] if row else 1500, r_new)
+                played = (row["matches_played"] if row else 0) + 1
+                wins   = (row["wins"] if row else 0) + (1 if result == "win" else 0)
+                losses = (row["losses"] if row else 0) + (1 if result == "loss" else 0)
+
+                conn.execute("""
+                    INSERT OR REPLACE INTO elo_ratings
+                    (team_id, team_type, gender, format, rating, matches_played,
+                     wins, losses, peak_rating, last_match_date,
+                     last_opponent, last_result, last_updated)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """, (team, team_type, elo_gender, elo_format,
+                      r_new, played, wins, losses, peak,
+                      match_date, opp, result, now))
+
+            conn.commit()
+
+            col1, col2 = st.columns(2)
+            col1.metric(f"{elo_team_a} new ELO", f"{ra_new:.0f}",
+                        f"{ra_new - ra_cur:+.1f}")
+            col2.metric(f"{elo_team_b} new ELO", f"{rb_new:.0f}",
+                        f"{rb_new - rb_cur:+.1f}")
+            st.success(f"✅ ELO ratings updated! K={k}")
+
+        except Exception as e:
+            st.error(f"ELO update error: {e}")
+            st.info("Tip: Make sure team names match exactly — e.g. 'India', 'England', 'Perth Scorchers'")
+
+    st.divider()
+
+    # ── Section 3: Bet history ─────────────────────────────────────────
+    st.subheader("3. Bet history")
+
+    history = conn.execute("""
+        SELECT bl.bet_date, bl.step, bl.stake, bl.odds_taken,
+               bl.outcome, bl.profit_loss, bl.bankroll_before,
+               bl.bankroll_after, bl.notes,
+               m.team_a, m.team_b, m.label
+        FROM bet_log bl
+        LEFT JOIN matches m ON bl.match_id = m.match_id
+        ORDER BY bl.step DESC
+        LIMIT 20
+    """).fetchall()
+
+    if history:
+        import pandas as pd
+        hdf = pd.DataFrame([dict(h) for h in history])
+        hdf["Match"] = hdf["team_a"] + " vs " + hdf["team_b"]
+        hdf["P&L"] = hdf["profit_loss"].apply(lambda x: f"€{x:+,.2f}")
+        hdf["Bankroll after"] = hdf["bankroll_after"].apply(lambda x: f"€{x:,.2f}")
+        hdf = hdf[["step","bet_date","Match","label","stake",
+                   "odds_taken","outcome","P&L","Bankroll after","notes"]]
+        hdf.columns = ["Step","Date","Match","Label","Stake","Odds","Result","P&L","Bankroll","Notes"]
+        st.dataframe(hdf, use_container_width=True, hide_index=True)
+
+        # Summary
+        wins_  = sum(1 for h in history if h["outcome"] == "win")
+        losses_= sum(1 for h in history if h["outcome"] == "loss")
+        total_pnl = sum(h["profit_loss"] or 0 for h in history)
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Bets logged", len(history))
+        c2.metric("Wins", wins_)
+        c3.metric("Losses", losses_)
+        c4.metric("Total P&L", f"€{total_pnl:+,.2f}")
+    else:
+        st.info("No bets logged yet. Use the form above to record your first result.")
