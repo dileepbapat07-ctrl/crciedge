@@ -143,6 +143,7 @@ with st.sidebar:
     page = st.radio("Navigate", [
         "📅 Daily brief",
         "🎯 Decision engine",
+        "📊 Over/Under totals",
         "📈 Bankroll tracker",
         "🧬 ELO ratings",
         "🛡 Risk framework",
@@ -354,6 +355,221 @@ elif page == "🎯 Decision engine":
             "Weight": ["22%","14%","10%","10%","10%","8%"]
         })
         st.dataframe(factors_df, use_container_width=True, hide_index=True)
+
+# ══════════════════════════════════════════════════════════════════════════
+# PAGE: OVER/UNDER TOTALS
+# ══════════════════════════════════════════════════════════════════════════
+elif page == "📊 Over/Under totals":
+    st.title("📊 Over / Under totals engine")
+    st.markdown(
+        "Compare our venue-based predicted score against the bookmaker's line. "
+        "Edge exists when the gap is large enough — bookmakers use generic global averages, "
+        "we use ground-specific Cricsheet data."
+    )
+    st.divider()
+
+    sys.path.insert(0, os.path.join(ROOT, "engine"))
+    from totals_engine import analyse_totals, TotalsContext
+
+    conn = get_db()
+
+    # Match selector
+    matches = conn.execute("""
+        SELECT match_id, date, step, phase, label, team_a, team_b,
+               format, category, gender, venue_id, city
+        FROM matches ORDER BY step ASC
+    """).fetchall()
+
+    col1, col2 = st.columns(2)
+    with col1:
+        fmt_tf = st.selectbox("Format", ["All","ODI","T20I","T20","Test"], key="tf_fmt")
+    with col2:
+        search_tf = st.text_input("Search team", "", key="tf_search")
+
+    filtered = [m for m in matches
+                if (fmt_tf == "All" or m["format"] == fmt_tf)
+                and (not search_tf or search_tf.lower() in
+                     (m["team_a"] + m["team_b"]).lower())]
+
+    match_opts = {
+        f"Step {m['step']:>3} | {m['date']} | {m['team_a']} vs {m['team_b']} [{m['format']}]":
+        dict(m) for m in filtered
+    }
+
+    if not match_opts:
+        st.warning("No matches found.")
+    else:
+        sel_lbl = st.selectbox(f"Select match ({len(match_opts)} shown)",
+                               list(match_opts.keys()), key="tf_match")
+        sm = match_opts[sel_lbl]
+
+        # Get venue stats preview
+        vs_row = conn.execute("""
+            SELECT avg_first_innings, avg_second_innings, matches_played,
+                   highest_score, lowest_score
+            FROM venue_stats
+            WHERE venue_id=? AND format IN (?,?)
+            ORDER BY matches_played DESC LIMIT 1
+        """, (sm["venue_id"],
+              sm["format"],
+              "T20" if sm["format"] == "T20I" else sm["format"])).fetchone()
+
+        # Show venue baseline
+        if vs_row and vs_row["avg_first_innings"]:
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Venue avg 1st innings", f"{vs_row['avg_first_innings']:.0f}")
+            c2.metric("Venue avg 2nd innings", f"{vs_row['avg_second_innings'] or 'N/A'}")
+            c3.metric("Venue matches", vs_row["matches_played"])
+            c4.metric("Highest score", vs_row["highest_score"] or "N/A")
+        else:
+            st.warning("No venue stats found — results will use defaults.")
+
+        st.divider()
+        st.subheader("Enter bookmaker lines")
+        st.caption("Get these from Betfair, Bet365 or Sportsbet on match morning")
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("**1st innings line**")
+            use_first = st.checkbox("Bet on 1st innings total", value=True)
+            bk_first  = st.number_input(
+                "Bookmaker 1st innings line",
+                min_value=50.0, max_value=500.0,
+                value=285.0 if sm["format"] in ("ODI","Test") else 162.0,
+                step=0.5, format="%.1f",
+                disabled=not use_first
+            )
+            odds_over_f  = st.number_input("Odds for OVER", 1.50, 3.00, 1.90, 0.01,
+                                           format="%.2f", disabled=not use_first)
+            odds_under_f = st.number_input("Odds for UNDER", 1.50, 3.00, 1.90, 0.01,
+                                           format="%.2f", disabled=not use_first)
+
+        with col2:
+            st.markdown("**Match total line (both innings)**")
+            use_total = st.checkbox("Bet on match total", value=False)
+            bk_total  = st.number_input(
+                "Bookmaker match total line",
+                min_value=100.0, max_value=1000.0,
+                value=580.0 if sm["format"] in ("ODI","Test") else 320.0,
+                step=0.5, format="%.1f",
+                disabled=not use_total
+            )
+
+        st.divider()
+        st.subheader("Conditions")
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            weather_sc = st.slider("Weather (1–10)", 1, 10, 8, key="tf_wx")
+        with col2:
+            pitch_t = st.selectbox("Pitch type",
+                ["flat","good","neutral","spin","green","deteriorating"],
+                key="tf_pitch")
+        with col3:
+            dew = st.checkbox("Dew expected (D/N)", key="tf_dew")
+        with col4:
+            gender_tf = st.radio("Gender", ["male","female"], horizontal=True,
+                                 key="tf_gen",
+                                 format_func=lambda x: "Men's" if x=="male" else "Women's")
+
+        if st.button("🔍 Analyse totals market", type="primary"):
+            ctx = TotalsContext(
+                match_id      = sm["match_id"],
+                venue_id      = sm["venue_id"],
+                format        = sm["format"],
+                gender        = gender_tf,
+                team_a        = sm["team_a"],
+                team_b        = sm["team_b"],
+                bankroll      = bankroll,
+                phase         = ph,
+                bk_line_first = bk_first if use_first else None,
+                bk_line_total = bk_total if use_total else None,
+                bk_odds_over  = odds_over_f,
+                bk_odds_under = odds_under_f,
+                weather_score = float(weather_sc),
+                pitch_type    = pitch_t,
+                dew_expected  = dew,
+            )
+
+            result = analyse_totals(ctx)
+
+            st.divider()
+            st.subheader("Engine output")
+
+            # Predictions
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Predicted 1st innings", f"{result.predicted_first:.0f}")
+            c2.metric("Predicted match total", f"{result.predicted_total:.0f}")
+            if use_first:
+                gap_col = "normal" if result.gap_first > 0 else "inverse"
+                c3.metric("Gap to 1st innings line",
+                          f"{result.gap_first:+.0f} runs",
+                          delta_color=gap_col)
+            if use_total:
+                c4.metric("Gap to total line", f"{result.gap_total:+.0f} runs")
+
+            st.divider()
+
+            # EV table
+            import pandas as pd
+            ev_data = []
+            if use_first:
+                ev_data.append({
+                    "Market": "1st innings OVER",
+                    "Line": f"{bk_first:.1f}",
+                    "Odds": odds_over_f,
+                    "EV %": f"{result.ev_first_over:+.1f}%",
+                    "Edge": "✅" if result.ev_first_over > 0 else "❌"
+                })
+                ev_data.append({
+                    "Market": "1st innings UNDER",
+                    "Line": f"{bk_first:.1f}",
+                    "Odds": odds_under_f,
+                    "EV %": f"{result.ev_first_under:+.1f}%",
+                    "Edge": "✅" if result.ev_first_under > 0 else "❌"
+                })
+            if use_total:
+                ev_data.append({
+                    "Market": "Match total OVER",
+                    "Line": f"{bk_total:.1f}",
+                    "Odds": odds_over_f,
+                    "EV %": f"{result.ev_total_over:+.1f}%",
+                    "Edge": "✅" if result.ev_total_over > 0 else "❌"
+                })
+                ev_data.append({
+                    "Market": "Match total UNDER",
+                    "Line": f"{bk_total:.1f}",
+                    "Odds": odds_under_f,
+                    "EV %": f"{result.ev_total_under:+.1f}%",
+                    "Edge": "✅" if result.ev_total_under > 0 else "❌"
+                })
+            if ev_data:
+                st.dataframe(pd.DataFrame(ev_data),
+                             use_container_width=True, hide_index=True)
+
+            st.divider()
+
+            # Final verdict
+            if result.verdict == "BET":
+                st.success(f"""
+                ### ✅ BET — {result.best_bet}
+                **EV: {result.best_ev:+.1f}%** · Confidence: {result.confidence:.0f}/100 · Stake: **€{result.recommended_stake:,.2f}**
+
+                {result.reason}
+                """)
+            elif result.verdict == "REDUCE":
+                st.warning(f"""
+                ### ⚡ REDUCE STAKE — {result.best_bet}
+                **EV: {result.best_ev:+.1f}%** · Confidence: {result.confidence:.0f}/100 · Stake: **€{result.recommended_stake:,.2f}**
+
+                {result.reason}
+                """)
+            else:
+                st.info(f"""
+                ### ⏸ SKIP totals market
+                {result.reason}
+
+                **Venue avg:** {result.venue_avg_first:.0f} (1st innings) from {result.venue_matches} matches
+                """)
 
 # ══════════════════════════════════════════════════════════════════════════
 # PAGE: BANKROLL TRACKER
@@ -773,24 +989,77 @@ elif page == "✏️ Log result":
     # ── Section 1: Log bet outcome ─────────────────────────────────────
     st.subheader("1. Record bet outcome")
 
-    # Get upcoming/recent matches that haven't been logged yet
-    logged_ids = [r["match_id"] for r in
-                  conn.execute("SELECT DISTINCT match_id FROM bet_log").fetchall()]
+    # ── Filters to narrow down the match list ────────────────────────
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        filter_cat = st.multiselect(
+            "Filter by category",
+            ["International","Franchise","Domestic","ACC"],
+            default=["International","Franchise","Domestic","ACC"],
+            key="log_cat"
+        )
+    with col2:
+        filter_search = st.text_input("Search team name", "",
+                                       placeholder="e.g. India, Perth...",
+                                       key="log_search")
+    with col3:
+        filter_month = st.selectbox(
+            "Filter by month",
+            ["All","Jul 2026","Aug 2026","Sep 2026",
+             "Oct 2026","Nov 2026","Dec 2026"],
+            key="log_month"
+        )
 
-    all_matches = conn.execute("""
-        SELECT match_id, date, step, label, team_a, team_b, format, category
+    # Build query dynamically
+    month_map = {
+        "Jul 2026": "2026-07", "Aug 2026": "2026-08",
+        "Sep 2026": "2026-09", "Oct 2026": "2026-10",
+        "Nov 2026": "2026-11", "Dec 2026": "2026-12",
+    }
+
+    sql = """
+        SELECT match_id, date, step, phase, label, team_a, team_b,
+               format, category, city
         FROM matches
-        ORDER BY date DESC, step DESC
-        LIMIT 50
-    """).fetchall()
+        WHERE 1=1
+    """
+    params = []
 
-    # Show all recent matches for selection
+    if filter_cat:
+        placeholders = ",".join("?" * len(filter_cat))
+        sql += f" AND category IN ({placeholders})"
+        params.extend(filter_cat)
+
+    if filter_search:
+        sql += " AND (team_a LIKE ? OR team_b LIKE ? OR series LIKE ?)"
+        s = f"%{filter_search}%"
+        params.extend([s, s, s])
+
+    if filter_month != "All" and filter_month in month_map:
+        sql += " AND date LIKE ?"
+        params.append(f"{month_map[filter_month]}%")
+
+    sql += " ORDER BY step ASC"
+
+    all_matches = conn.execute(sql, params).fetchall()
+
+    st.caption(f"{len(all_matches)} matches found")
+
+    if not all_matches:
+        st.warning("No matches found with these filters.")
+        st.stop()
+
+    # Build dropdown options
     match_options = {
-        f"Step {m['step']} | {m['date']} | {m['team_a']} vs {m['team_b']} ({m['label']})": dict(m)
+        f"Step {m['step']:>3} | {m['date']} | {m['team_a']} vs {m['team_b']} — {m['label']} [{m['format']}]": dict(m)
         for m in all_matches
     }
 
-    selected_label = st.selectbox("Select match", list(match_options.keys()))
+    selected_label = st.selectbox(
+        f"Select match ({len(all_matches)} shown)",
+        list(match_options.keys()),
+        key="log_match_sel"
+    )
     selected_match = match_options[selected_label]
 
     col1, col2, col3 = st.columns(3)
