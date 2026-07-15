@@ -958,7 +958,7 @@ elif page == "👤 Player analytics":
             if st.button("🌐 Fetch XI from ESPNcricinfo", type="primary", key="xi_fetch"):
                 sys.path.insert(0, os.path.join(ROOT, "scripts"))
                 try:
-                    from fetch_playing_xi import fetch_and_store_xi
+                    from fetch_playingxi import fetch_and_store_xi
                     with st.spinner(f"Searching ESPNcricinfo for {sm_xi['team_a']} vs {sm_xi['team_b']}..."):
                         result = fetch_and_store_xi(
                             match_id   = sm_xi["match_id"],
@@ -1014,7 +1014,7 @@ elif page == "👤 Player analytics":
                          disabled=not xi_paste):
                 sys.path.insert(0, os.path.join(ROOT, "scripts"))
                 try:
-                    from fetch_playing_xi import fetch_and_store_xi
+                    from fetch_playingxi import fetch_and_store_xi
                     with st.spinner("Parsing XI..."):
                         result = fetch_and_store_xi(
                             match_id   = sm_xi["match_id"],
