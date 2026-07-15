@@ -144,6 +144,7 @@ with st.sidebar:
         "📅 Daily brief",
         "🎯 Decision engine",
         "📊 Over/Under totals",
+        "👤 Player analytics",
         "📈 Bankroll tracker",
         "🧬 ELO ratings",
         "🛡 Risk framework",
@@ -162,121 +163,230 @@ ph = st.session_state.phase
 # PAGE: DAILY BRIEF
 # ══════════════════════════════════════════════════════════════════════════
 if page == "📅 Daily brief":
+    import datetime as dt
+
+    conn = get_db()
+    today     = dt.date.today().isoformat()
+    today_fmt = dt.date.today().strftime("%A, %d %B %Y")
+
+    # ── Load this week's matches from DB ──────────────────────────────────
+    week_end = (dt.date.today() + dt.timedelta(days=6)).isoformat()
+    week_matches = conn.execute("""
+        SELECT m.*,
+               w.rain_prob_pct, w.condition, w.temp_celsius, w.dl_risk,
+               vs.avg_first_innings, vs.bat_first_win_pct
+        FROM matches m
+        LEFT JOIN weather w ON w.venue_id = m.venue_id AND w.match_date = m.date
+        LEFT JOIN venue_stats vs ON vs.venue_id = m.venue_id AND vs.format = m.format
+        WHERE m.date BETWEEN ? AND ?
+        ORDER BY m.date, m.step
+    """, (today, week_end)).fetchall()
+
+    logged_steps = set(
+        r["step"] for r in
+        conn.execute("SELECT step FROM bet_log").fetchall()
+    )
+
+    bk_row = conn.execute(
+        "SELECT closing_balance FROM bankroll ORDER BY step DESC LIMIT 1"
+    ).fetchone()
+    current_bk = bk_row["closing_balance"] if bk_row else bankroll
+
+    # ── Header ─────────────────────────────────────────────────────────────
     st.title("📅 Daily brief")
-    today = date.today().strftime("%A, %d %B %Y")
-    st.markdown(f"**{today}** · Bankroll **€{bankroll:,.2f}** · Phase {ph} · {'2%' if ph==1 else '1%'} target/bet")
+    st.markdown(f"**{today_fmt}** · Auto-generated from database · Phase {ph}")
     st.divider()
 
-    # Top metrics
-    c1,c2,c3,c4 = st.columns(4)
-    c1.metric("Bankroll", f"€{bankroll:,.2f}")
-    c2.metric("This week bets", "3")
-    c3.metric("Total stake", "€374")
-    c4.metric("Max profit", "€403", "+€403")
+    today_matches = [m for m in week_matches if m["date"] == today]
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Bankroll",        f"€{current_bk:,.2f}")
+    c2.metric("Today's matches", len(today_matches))
+    c3.metric("This week",        len(week_matches))
+    c4.metric("Bets logged",
+              len([m for m in week_matches if m["step"] in logged_steps]))
 
-    st.subheader("This week's verdicts")
+    # ── Decision engine helper ──────────────────────────────────────────────
+    try:
+        sys.path.insert(0, os.path.join(ROOT, "engine"))
+        from decision_engine import decide, MatchContext
+        ENGINE_OK = True
+    except Exception:
+        ENGINE_OK = False
 
-    # ── Match cards ──────────────────────────────────────────────────────
-    weekly = [
-        {
-            "label": "1st ODI — INDIA vs England",
-            "meta": "Edgbaston, Birmingham · Today · Step 1",
-            "verdict": "BET",
-            "odds": 2.08,
-            "conf": 74,
-            "ev": 14.4,
-            "stake": round(bankroll * 0.033, 2),
-            "reason": (
-                "India won last **5 ODIs** vs England (8-2 in last 10). "
-                "Rohit avg 89.4 at Edgbaston. Kohli avg 123 in last 7 ODI innings. "
-                "Weather: ☀️ Clear 29°C, rain <5%. ELO: India 1799 vs England 1551 (+249 delta)."
-            ),
-            "card": "bet-card",
-        },
-        {
-            "label": "2nd ODI — INDIA vs England (D/N)",
-            "meta": "Sophia Gardens, Cardiff · Thu 16 Jul · Step 3",
-            "verdict": "BET",
-            "odds": 2.05,
-            "conf": 72,
-            "ev": 8.7,
-            "stake": round(bankroll * 0.028, 2),
-            "reason": (
-                "D/N Cardiff — dew in 2nd innings benefits chaser. "
-                "India's 5-match ODI winning streak vs England continues. "
-                "Confirm Betfair odds Thursday morning before placing."
-            ),
-            "card": "bet-card",
-        },
-        {
-            "label": "3rd ODI — INDIA vs England (Lord's)",
-            "meta": "Lord's, London · Sun 19 Jul · Step 5 · Series decider",
-            "verdict": "BET",
-            "odds": 2.10,
-            "conf": 72,
-            "ev": 9.2,
-            "stake": round(bankroll * 0.028, 2),
-            "reason": (
-                "Lord's series decider. India's historical record at Lord's strong. "
-                "High importance match. Confirm odds Sunday morning."
-            ),
-            "card": "bet-card",
-        },
-        {
-            "label": "WI vs New Zealand — 3 ODIs",
-            "meta": "Providence & Barbados · Jul 14, 16, 19",
-            "verdict": "SKIP",
-            "odds": 1.68,
-            "conf": 51,
-            "ev": -3.2,
-            "stake": 0,
-            "reason": (
-                "WI priced 1.65–1.72 — market already overprices them. "
-                "Negative EV on all three. No value available this week."
-            ),
-            "card": "skip-card",
-        },
-    ]
+    def run_engine(m, bk):
+        if not ENGINE_OK: return None
+        try:
+            odds_row = conn.execute("""
+                SELECT decimal_odds FROM odds
+                WHERE match_id=? AND market='match_winner' LIMIT 1
+            """, (m["match_id"],)).fetchone()
+            odds = odds_row["decimal_odds"] if odds_row else 1.90
+            ra = get_elo(m["team_a"], "male" if m["gender"] in ("male","Men's") else "female", m["format"])
+            rb = get_elo(m["team_b"], "male" if m["gender"] in ("male","Men's") else "female", m["format"])
+            wp = elo_win_prob(ra, rb)
+            ctx = MatchContext(
+                match_id=m["match_id"], date=m["date"], label=m["label"],
+                team_a=m["team_a"], team_b=m["team_b"],
+                format=m["format"], category=m["category"],
+                gender=m["gender"], venue_id=m["venue_id"], city=m["city"],
+                step=m["step"], phase=m["phase"],
+                bankroll=bk, decimal_odds=odds, win_prob=wp,
+                player_status="unknown", importance="medium", toss_impact="medium",
+            )
+            return decide(ctx)
+        except Exception:
+            return None
 
-    for m in weekly:
-        css = m["card"]
-        col1, col2 = st.columns([4, 1])
-        with col1:
+    # ── TODAY'S MATCHES ────────────────────────────────────────────────────
+    if today_matches:
+        st.subheader(f"📌 Today — {dt.date.today().strftime('%a %d %b')}")
+        for m in today_matches:
+            d = run_engine(m, current_bk)
+            already = m["step"] in logged_steps
+            rain = m["rain_prob_pct"] or 0
+            temp = m["temp_celsius"] or "—"
+            wx   = f"{'☀️' if rain<20 else '🌦' if rain<50 else '🌧'} {m['condition'] or 'unknown'} · {temp}°C · Rain {rain:.0f}%"
+
+            v = d.verdict if d else "—"
+            css = "bet-card" if v=="BET" else "reduce-card" if v=="REDUCE" else "skip-card"
+            vb  = "vb-bet"  if v=="BET" else "vb-red"    if v=="REDUCE" else "vb-ski"
+            icon= "✅" if v=="BET" else "⚡" if v=="REDUCE" else "⏸"
+            ev_s    = f"{d.ev_pct:+.1f}%"   if d else "—"
+            conf_s  = f"{d.confidence_score:.0f}/100" if d else "—"
+            stake_s = f"€{d.recommended_stake:,.2f}"  if d else "—"
+            logged_s = " · ✅ Logged" if already else ""
+            cat_tag = "ti" if m["category"]=="International" else "tf"
+
             st.markdown(f"""
             <div class="{css}">
-              <div class="card-title">{m['label']}</div>
-              <div class="card-meta">{m['meta']}</div>
-              <div style="display:flex;gap:16px;margin-top:8px;font-size:13px">
-                <span>Odds: <strong>{m['odds']}</strong></span>
-                <span>Confidence: <strong>{m['conf']}/100</strong></span>
-                <span>EV: <strong style="color:{'#1DB87A' if m['ev']>0 else '#E84040'}">{m['ev']:+.1f}%</strong></span>
-                <span>Stake: <strong>€{m['stake']:,.2f}</strong></span>
+              <div class="mch">
+                <div>
+                  <div class="mct">{m["team_a"]} vs {m["team_b"]}</div>
+                  <div class="mcm"><span class="tag {cat_tag}">{m["category"]}</span>
+                  {m["label"]} · {m["format"]} · {m["city"]} · Step {m["step"]}{logged_s}</div>
+                </div>
+                <div class="vb {vb}">{icon} {v}</div>
               </div>
-              <div class="card-reason">{m['reason']}</div>
-            </div>
-            """, unsafe_allow_html=True)
+              <div style="display:flex;gap:20px;margin:8px 0;font-size:13px;flex-wrap:wrap">
+                <span>EV: <strong style="color:'#1DB87A' if d and d.ev_pct>0 else '#E84040'">{ev_s}</strong></span>
+                <span>Confidence: <strong>{conf_s}</strong></span>
+                <span>Stake: <strong>{stake_s}</strong></span>
+              </div>
+              <div class="mr">{wx}</div>
+            </div>""", unsafe_allow_html=True)
 
-    # Supplementary markets
-    st.markdown("""
-    <div class="supp-box">
-    <strong style="color:#3A8EE8">📊 Supplementary markets — Betfair/Sky Bet (Edgbaston today)</strong><br><br>
-    Both teams 300+ runs: <strong>7/4 (2.75)</strong> — flat pitch, clear 29°C, all top batters playing<br>
-    Both teams 325+: <strong>4/1 (5.00)</strong> — speculative, England scored 400 here last summer<br>
-    Kohli top India scorer: <strong>5/2 (3.50)</strong> — avg 123 in last 7 ODI innings<br>
-    KL Rahul top bat India: <strong>8/1 (9.00)</strong> — value if he opens
-    </div>
-    """, unsafe_allow_html=True)
+            if d:
+                with st.expander(f"Factor breakdown"):
+                    import pandas as pd
+                    fs = d.factor_scores
+                    fdf = pd.DataFrame([
+                        {"Factor":"Value edge (EV)","Score":fs.value_edge,"Weight":"22%"},
+                        {"Factor":"Team form",      "Score":fs.form,      "Weight":"14%"},
+                        {"Factor":"H2H / ELO",      "Score":fs.h2h,       "Weight":"10%"},
+                        {"Factor":"Venue",           "Score":fs.venue,     "Weight":"10%"},
+                        {"Factor":"Weather",         "Score":fs.weather,   "Weight":"10%"},
+                        {"Factor":"Players",         "Score":fs.players,   "Weight":"10%"},
+                        {"Factor":"Market",          "Score":fs.market,    "Weight":"8%"},
+                        {"Factor":"Importance",      "Score":fs.importance,"Weight":"7%"},
+                    ])
+                    st.dataframe(fdf, width="stretch", hide_index=True,
+                                 column_config={"Score": st.column_config.ProgressColumn(
+                                     "Score", min_value=0, max_value=10, format="%.1f")})
+                    ra = get_elo(m["team_a"],"male",m["format"])
+                    rb = get_elo(m["team_b"],"male",m["format"])
+                    st.caption(f"ELO: {m['team_a']} {ra:.0f} · {m['team_b']} {rb:.0f} · Delta {ra-rb:+.0f}")
+    else:
+        st.info(f"No matches scheduled for today ({today}). Next matches are coming up this week.")
 
-    # In-play rules
+    # ── REST OF WEEK ────────────────────────────────────────────────────────
+    upcoming = [m for m in week_matches if m["date"] > today]
+    if upcoming:
+        st.divider()
+        st.subheader("📆 Rest of this week")
+        prev_date = None
+        for m in upcoming:
+            if m["date"] != prev_date:
+                dobj = dt.date.fromisoformat(m["date"])
+                st.markdown(f"**{dobj.strftime('%a %d %b')}**")
+                prev_date = m["date"]
+            d = run_engine(m, current_bk)
+            already = m["step"] in logged_steps
+            v    = d.verdict if d else "—"
+            col  = "#1DB87A" if v=="BET" else "#E8A020" if v=="REDUCE" else "#5A7090"
+            icon = "✅" if v=="BET" else "⚡" if v=="REDUCE" else "⏸"
+            detail = f"EV {d.ev_pct:+.1f}% · Conf {d.confidence_score:.0f}/100 · Stake €{d.recommended_stake:,.2f}" if d else "No engine data"
+            logged_s = " ✅" if already else ""
+            st.markdown(
+                f"<div style='display:flex;justify-content:space-between;align-items:center;"
+                f"padding:8px 12px;background:var(--card);border:1px solid var(--bdr);"
+                f"border-radius:8px;margin-bottom:6px'>"
+                f"<span style='font-size:13px'><strong>{m['team_a']} vs {m['team_b']}</strong>"
+                f" <span style='color:#5A7090'>· {m['label']} · {m['format']} · Step {m['step']}{logged_s}</span></span>"
+                f"<span style='font-size:12px;color:{col};font-weight:600'>{icon} {v}"
+                f" <span style='color:#8AA0B8;font-weight:400'>· {detail}</span></span>"
+                f"</div>", unsafe_allow_html=True)
+
+    # ── Supplementary markets from DB ───────────────────────────────────────
+    supp = conn.execute("""
+        SELECT o.*, m.team_a, m.team_b, m.date
+        FROM odds o JOIN matches m ON o.match_id = m.match_id
+        WHERE m.date BETWEEN ? AND ? AND o.market NOT IN ('match_winner')
+        ORDER BY m.date, o.market
+    """, (today, week_end)).fetchall()
+
+    if supp:
+        st.divider()
+        st.subheader("📊 Supplementary markets")
+        for s in supp:
+            ev = round((1/s["implied_prob"] - 1) * 100, 1) if s["implied_prob"] else 0
+            col = "#1DB87A" if ev > 5 else "#5A7090"
+            st.markdown(
+                f"<div style='padding:7px 12px;background:var(--card);border:1px solid var(--bdr);"
+                f"border-radius:8px;margin-bottom:5px;font-size:13px;"
+                f"display:flex;justify-content:space-between'>"
+                f"<span><strong>{s['team_a']} vs {s['team_b']}</strong> · {s['market']} · {s['selection']}</span>"
+                f"<span style='color:{col}'>{s['decimal_odds']} odds · EV {ev:+.1f}%</span>"
+                f"</div>", unsafe_allow_html=True)
+
+    # ── Risk status ──────────────────────────────────────────────────────────
     st.divider()
-    st.subheader("In-play rules — today's match")
+    st.subheader("🛡 Risk status")
+    today_staked = sum(r["stake"] for r in
+        conn.execute("SELECT stake FROM bet_log WHERE bet_date=?", (today,)).fetchall()) or 0.0
+    daily_cap = round(current_bk * 0.05, 2)
+    rem = max(0, daily_cap - today_staked)
+    pct = min(100, round(today_staked/daily_cap*100, 1)) if daily_cap > 0 else 0
     c1, c2, c3 = st.columns(3)
-    with c1:
-        st.success("**Entry 1 — Pre-match**\n\nBet India at 2.08 before 11:00 BST. Max exposure today: 3.3% of bankroll.")
-    with c2:
-        st.warning("**Entry 2 — Innings break (optional)**\n\nOnly if England post 260–290. Add max €83 at odds 1.75–1.95. Total stays under 5% cap.")
-    with c3:
-        st.error("**No entry after 15 overs**\n\nNever add after 15 overs of the chase. One match = max 2 entries = max 5% bankroll.")
+    c1.metric("Staked today", f"€{today_staked:,.2f}", f"{pct}% of cap")
+    c2.metric("Daily cap (5%)", f"€{daily_cap:,.2f}")
+    c3.metric("Remaining today", f"€{rem:,.2f}",
+              "✓ Safe" if rem > 0 else "⚠ At cap",
+              delta_color="normal" if rem > 0 else "inverse")
+    st.progress(pct/100, text=f"{pct}% of daily cap used")
+
+    # ── Recent bets ──────────────────────────────────────────────────────────
+    recent = conn.execute("""
+        SELECT bl.*, m.team_a, m.team_b FROM bet_log bl
+        LEFT JOIN matches m ON bl.match_id = m.match_id
+        ORDER BY bl.step DESC LIMIT 5
+    """).fetchall()
+    if recent:
+        st.divider()
+        st.subheader("📋 Recent bets")
+        for b in recent:
+            icon = "✅" if b["outcome"]=="win" else "❌" if b["outcome"]=="loss" else "⬜"
+            pnl = b["profit_loss"] or 0
+            col = "#1DB87A" if pnl > 0 else "#E84040"
+            st.markdown(
+                f"<div style='padding:7px 12px;background:var(--card);border:1px solid var(--bdr);"
+                f"border-radius:8px;margin-bottom:5px;font-size:13px;"
+                f"display:flex;justify-content:space-between'>"
+                f"<span>{icon} Step {b['step']} · {b['bet_date']} · "
+                f"{b['team_a'] or '—'} vs {b['team_b'] or '—'}</span>"
+                f"<span>€{b['stake']:,.2f} @ {b['odds_taken']} · "
+                f"<strong style='color:{col}'>€{pnl:+,.2f}</strong></span>"
+                f"</div>", unsafe_allow_html=True)
+
 
 # ══════════════════════════════════════════════════════════════════════════
 # PAGE: DECISION ENGINE
@@ -570,6 +680,456 @@ elif page == "📊 Over/Under totals":
 
                 **Venue avg:** {result.venue_avg_first:.0f} (1st innings) from {result.venue_matches} matches
                 """)
+
+# ══════════════════════════════════════════════════════════════════════════
+# PAGE: PLAYER ANALYTICS
+# ══════════════════════════════════════════════════════════════════════════
+elif page == "👤 Player analytics":
+    st.title("👤 Player analytics")
+    st.markdown(
+        "Head-to-head matchups, venue records and form scores for key players. "
+        "Feeds directly into the confidence score as the **players factor (10% weight)**."
+    )
+    st.divider()
+
+    PLAYER_DB = os.path.join(ROOT, "db", "player_engine.db")
+
+    if not os.path.exists(PLAYER_DB):
+        st.error("player_engine.db not found. Upload it to the db/ folder on GitHub.")
+        st.stop()
+
+    pconn = sqlite3.connect(PLAYER_DB)
+    pconn.row_factory = sqlite3.Row
+
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "🏏 Match signal", "⚔️ Player matchups",
+        "📍 Venue records", "📋 Playing XI"
+    ])
+
+    # ── TAB 1: MATCH SIGNAL ──────────────────────────────────
+    with tab1:
+        st.subheader("Player signal for any match")
+        st.caption("Computes a 0–10 confidence factor for team_a based on batting, bowling, form, venue and matchup data.")
+
+        conn_ce = get_db()
+        matches_ps = conn_ce.execute(
+            "SELECT match_id, date, step, label, team_a, team_b, format, venue_id, category FROM matches ORDER BY step"
+        ).fetchall()
+
+        col1, col2 = st.columns(2)
+        with col1:
+            fmt_ps = st.selectbox("Format", ["All","ODI","T20I","T20","Test"], key="ps_fmt")
+        with col2:
+            search_ps = st.text_input("Search team", "", key="ps_search")
+
+        filtered_ps = [m for m in matches_ps
+                       if (fmt_ps == "All" or m["format"] == fmt_ps)
+                       and (not search_ps or search_ps.lower() in (m["team_a"]+m["team_b"]).lower())]
+
+        opts_ps = {
+            f"Step {m['step']:>3} | {m['date']} | {m['team_a']} vs {m['team_b']} [{m['format']}]": dict(m)
+            for m in filtered_ps
+        }
+
+        if opts_ps:
+            sel_ps  = st.selectbox(f"Select match ({len(opts_ps)} shown)", list(opts_ps.keys()), key="ps_sel")
+            sm_ps   = opts_ps[sel_ps]
+
+            if st.button("▶ Run player signal", type="primary", key="ps_run"):
+                sys.path.insert(0, os.path.join(ROOT, "player_engine"))
+                try:
+                    from player_signal import get_player_signal
+                    with st.spinner("Computing player signal..."):
+                        sig = get_player_signal(
+                            match_id = sm_ps["match_id"],
+                            team_a   = sm_ps["team_a"],
+                            team_b   = sm_ps["team_b"],
+                            fmt      = sm_ps["format"],
+                            venue_id = sm_ps["venue_id"],
+                        )
+
+                    ta = sig.team_a_signal
+                    tb = sig.team_b_signal
+
+                    # Top metrics
+                    c1,c2,c3,c4,c5 = st.columns(5)
+                    c1.metric("Signal factor", f"{sig.signal_factor:.1f}/10",
+                              "India advantage" if sig.signal_factor > 5.5
+                              else "England advantage" if sig.signal_factor < 4.5 else "Even")
+                    c2.metric("EV adjustment", f"{sig.signal_ev_adj:+.1f}%",
+                              f"for {sm_ps['team_a']}")
+                    c3.metric(f"{sm_ps['team_a']} overall", f"{ta.overall:.1f}/10")
+                    c4.metric(f"{sm_ps['team_b']} overall", f"{tb.overall:.1f}/10")
+                    c5.metric("Data quality", sig.data_quality.upper())
+
+                    st.divider()
+
+                    # Factor breakdown table
+                    import pandas as pd
+                    factor_data = [
+                        {"Factor":"Batting",     sm_ps["team_a"]: ta.batting_score,  sm_ps["team_b"]: tb.batting_score},
+                        {"Factor":"Bowling",     sm_ps["team_a"]: ta.bowling_score,  sm_ps["team_b"]: tb.bowling_score},
+                        {"Factor":"Form",        sm_ps["team_a"]: ta.form_score,     sm_ps["team_b"]: tb.form_score},
+                        {"Factor":"Venue record",sm_ps["team_a"]: ta.venue_score,    sm_ps["team_b"]: tb.venue_score},
+                        {"Factor":"Matchups",    sm_ps["team_a"]: ta.matchup_score,  sm_ps["team_b"]: tb.matchup_score},
+                        {"Factor":"Availability",sm_ps["team_a"]: ta.avail_score,    sm_ps["team_b"]: tb.avail_score},
+                        {"Factor":"OVERALL",     sm_ps["team_a"]: ta.overall,        sm_ps["team_b"]: tb.overall},
+                    ]
+                    fdf = pd.DataFrame(factor_data)
+                    st.dataframe(fdf, width="stretch", hide_index=True,
+                                 column_config={
+                                     sm_ps["team_a"]: st.column_config.ProgressColumn(
+                                         sm_ps["team_a"], min_value=0, max_value=10, format="%.1f"),
+                                     sm_ps["team_b"]: st.column_config.ProgressColumn(
+                                         sm_ps["team_b"], min_value=0, max_value=10, format="%.1f"),
+                                 })
+
+                    # Key insights
+                    if sig.key_insights:
+                        st.divider()
+                        st.subheader("Key matchup insights")
+                        for ins in sig.key_insights:
+                            if "dominates" in ins or "OUT" in ins:
+                                st.warning(f"⚠ {ins}")
+                            elif "exceptional" in ins or "outstanding" in ins:
+                                st.success(f"✅ {ins}")
+                            else:
+                                st.info(f"ℹ {ins}")
+
+                    # Key batters
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        if ta.key_batters:
+                            st.subheader(f"{sm_ps['team_a']} batting")
+                            for b in ta.key_batters:
+                                arrow = {"up":"↑","flat":"→","down":"↓"}.get(b["trend"],"→")
+                                avg = f"  L5 avg: {b['l5avg']}" if b.get("l5avg") else ""
+                                st.metric(b["name"], f"{b['form']}/10 {arrow}", avg)
+
+                    with col2:
+                        if ta.key_bowlers:
+                            st.subheader(f"{sm_ps['team_a']} bowling")
+                            for b in ta.key_bowlers:
+                                rank = f"ICC #{b['rank']}" if b.get("rank") else b.get("style","")
+                                st.metric(b["name"], f"{b['form']}/10", rank)
+
+                    # Injuries
+                    all_inj = ta.injuries + tb.injuries
+                    real_inj = [i for i in all_inj if "OUT" in i or "not playing" in i.lower()]
+                    if real_inj:
+                        st.divider()
+                        st.subheader("Availability alerts")
+                        for inj in real_inj:
+                            st.error(inj)
+
+                except Exception as e:
+                    st.error(f"Player signal error: {e}")
+                    st.caption("Make sure player_engine.db is in the db/ folder")
+
+    # ── TAB 2: PLAYER MATCHUPS ────────────────────────────────
+    with tab2:
+        st.subheader("Batter vs bowler head-to-head")
+        st.caption("Who has the edge when specific players meet? Minimum 12 balls to show.")
+
+        pvp_rows = pconn.execute("""
+            SELECT pvp.*,
+                   bp.name  AS batter_name,  bp.team AS batter_team,
+                   bwp.name AS bowler_name, bwp.team AS bowler_team
+            FROM player_vs_player pvp
+            JOIN players bp  ON pvp.batter_id  = bp.player_id
+            JOIN players bwp ON pvp.bowler_id  = bwp.player_id
+            WHERE pvp.balls >= 12
+            ORDER BY pvp.balls DESC
+        """).fetchall()
+
+        if pvp_rows:
+            import pandas as pd
+            pvp_df = pd.DataFrame([{
+                "Batter":      r["batter_name"],
+                "Batter team": r["batter_team"],
+                "Bowler":      r["bowler_name"],
+                "Bowler team": r["bowler_team"],
+                "Format":      r["format"],
+                "Balls":       r["balls"],
+                "Runs":        r["runs"],
+                "Dismissals":  r["dismissals"],
+                "SR":          round(r["strike_rate"] or 0, 1),
+                "Dot %":       round(r["dot_pct"] or 0, 1),
+                "Last 5":      r["last_5_results"] or "",
+                "Edge":        "🎳 Bowler" if r["bowler_dominates"]
+                               else "🏏 Batter" if r["batter_dominates"]
+                               else "Even",
+            } for r in pvp_rows])
+
+            # Filter
+            col1, col2 = st.columns(2)
+            with col1:
+                edge_f = st.selectbox("Edge filter",
+                    ["All","🎳 Bowler dominates","🏏 Batter dominates","Even"],
+                    key="pvp_edge")
+            with col2:
+                team_f = st.text_input("Filter by team", "", key="pvp_team")
+
+            if edge_f != "All":
+                pvp_df = pvp_df[pvp_df["Edge"] == edge_f.split(" ",1)[1] if " " in edge_f else edge_f]
+            if team_f:
+                pvp_df = pvp_df[
+                    pvp_df["Batter team"].str.contains(team_f, case=False) |
+                    pvp_df["Bowler team"].str.contains(team_f, case=False)
+                ]
+
+            st.dataframe(pvp_df, width="stretch", hide_index=True)
+            st.caption(f"{len(pvp_df)} matchup records")
+        else:
+            st.info("No matchup data yet. Add more player data via seed_players.py")
+
+    # ── TAB 3: VENUE RECORDS ─────────────────────────────────
+    with tab3:
+        st.subheader("Player venue records")
+        st.caption("Career batting/bowling averages at specific grounds.")
+
+        col1, col2 = st.columns(2)
+        with col1:
+            player_search = st.text_input("Search player name", "Kohli", key="pvs_player")
+        with col2:
+            fmt_pvs = st.selectbox("Format  ", ["ODI","T20I","T20","Test"], key="pvs_fmt")
+
+        pvs_rows = pconn.execute("""
+            SELECT pvs.*, p.name, p.team, p.role
+            FROM player_venue_stats pvs
+            JOIN players p ON pvs.player_id = p.player_id
+            WHERE p.name LIKE ? AND pvs.format=?
+            ORDER BY pvs.avg_score DESC NULLS LAST
+        """, (f"%{player_search}%", fmt_pvs)).fetchall()
+
+        if pvs_rows:
+            import pandas as pd
+            pvs_df = pd.DataFrame([{
+                "Player":  r["name"],
+                "Team":    r["team"],
+                "Venue":   r["venue_id"].replace("-"," ").title(),
+                "Innings": r["innings"],
+                "Avg":     round(r["avg_score"] or 0, 1),
+                "SR":      round(r["avg_sr"] or 0, 1),
+                "High":    r["highest_score"] or "-",
+                "50s":     r["fifties"],
+                "100s":    r["hundreds"],
+                "L3 avg":  round(r["avg_last_3"] or 0, 1),
+                "Wkts":    r["bowl_wickets"] or "-",
+                "Eco":     round(r["bowl_economy"] or 0, 2) if r["bowl_economy"] else "-",
+            } for r in pvs_rows])
+
+            st.dataframe(pvs_df, width="stretch", hide_index=True,
+                         column_config={
+                             "Avg": st.column_config.NumberColumn("Avg", format="%.1f"),
+                             "SR":  st.column_config.NumberColumn("SR",  format="%.1f"),
+                         })
+
+            # Highlight best venue
+            if len(pvs_df) > 1:
+                best = pvs_df.loc[pvs_df["Avg"].idxmax()]
+                st.success(f"Best venue: **{best['Venue']}** — avg {best['Avg']:.0f} in {best['Innings']} innings")
+        else:
+            st.info(f"No venue data found for '{player_search}' in {fmt_pvs}. Try 'Kohli', 'Root' or 'Bumrah'.")
+
+    # ── TAB 4: PLAYING XI ────────────────────────────────────
+    with tab4:
+        st.subheader("Playing XI — auto-fetch after toss")
+        st.caption("Press the button after toss is announced. Takes ~5 seconds.")
+
+        conn_ce2 = get_db()
+        matches_xi = conn_ce2.execute(
+            "SELECT match_id, date, step, label, team_a, team_b, format FROM matches ORDER BY date, step LIMIT 30"
+        ).fetchall()
+
+        xi_opts = {
+            f"Step {m['step']} | {m['date']} | {m['team_a']} vs {m['team_b']} [{m['format']}]": dict(m)
+            for m in matches_xi
+        }
+        sel_xi = st.selectbox("Match", list(xi_opts.keys()), key="xi_match")
+        sm_xi  = xi_opts[sel_xi]
+
+        # ── SECTION 1: Auto-fetch button ──────────────────────
+        st.markdown("#### 1. Auto-fetch from ESPNcricinfo")
+        st.caption("Works best ~10 min after toss when ESPNcricinfo has updated the page.")
+
+        col1, col2 = st.columns([2, 1])
+        with col1:
+            if st.button("🌐 Fetch XI from ESPNcricinfo", type="primary", key="xi_fetch"):
+                sys.path.insert(0, os.path.join(ROOT, "scripts"))
+                try:
+                    from fetch_playing_xi import fetch_and_store_xi
+                    with st.spinner(f"Searching ESPNcricinfo for {sm_xi['team_a']} vs {sm_xi['team_b']}..."):
+                        result = fetch_and_store_xi(
+                            match_id   = sm_xi["match_id"],
+                            match_date = sm_xi["date"],
+                            team_a     = sm_xi["team_a"],
+                            team_b     = sm_xi["team_b"],
+                        )
+
+                    if result["success"]:
+                        st.success(f"✅ Fetched via {result['method']} — {result['count']} players saved")
+                        if result.get("toss_winner"):
+                            st.info(f"🪙 Toss: **{result['toss_winner']}** won and chose to **{result['toss_choice']}**")
+                        for team, players in result.get("players", {}).items():
+                            st.write(f"**{team}:** {', '.join(players)}")
+                    else:
+                        st.warning("Auto-fetch failed — ESPNcricinfo may not have updated yet. Try pasting the XI below.")
+
+                    with st.expander("Fetch log"):
+                        for line in result.get("log", []):
+                            st.text(line)
+
+                except ImportError as e:
+                    st.error(f"Missing dependency: {e}\nRun: pip install requests beautifulsoup4")
+                except Exception as e:
+                    st.error(f"Fetch error: {e}")
+
+        # ── SECTION 2: Paste XI text ──────────────────────────
+        st.markdown("#### 2. Paste XI text (most reliable)")
+        st.caption(
+            "Copy the XI from Cricbuzz, ESPNcricinfo or any news article and paste below. "
+            "Format: `India: Rohit Sharma, Shubman Gill(c), Virat Kohli...`"
+        )
+
+        xi_paste = st.text_area(
+            "Paste playing XI text here",
+            placeholder=(
+                "India: Rohit Sharma, Shubman Gill(c), Virat Kohli, Shreyas Iyer, "
+                "KL Rahul(wk), Washington Sundar, Axar Patel, Kuldeep Yadav, "
+                "Jasprit Bumrah, Gurnoor Brar, Prasidh Krishna\n\n"
+                "England: Jacob Bethell, Ben Duckett, Joe Root, Harry Brook(c), "
+                "Jos Buttler(wk), Sam Curran, Will Jacks, Jofra Archer, "
+                "Liam Dawson, Josh Tongue, Adil Rashid"
+            ),
+            height=120,
+            key="xi_paste"
+        )
+
+        col1, col2 = st.columns([2, 1])
+        with col1:
+            dry_run = st.checkbox("Dry run (preview only, no save)", key="xi_dry")
+        with col2:
+            if st.button("💾 Parse & save XI", type="primary", key="xi_parse",
+                         disabled=not xi_paste):
+                sys.path.insert(0, os.path.join(ROOT, "scripts"))
+                try:
+                    from fetch_playing_xi import fetch_and_store_xi
+                    with st.spinner("Parsing XI..."):
+                        result = fetch_and_store_xi(
+                            match_id   = sm_xi["match_id"],
+                            match_date = sm_xi["date"],
+                            team_a     = sm_xi["team_a"],
+                            team_b     = sm_xi["team_b"],
+                            xi_text    = xi_paste,
+                            dry_run    = dry_run,
+                        )
+
+                    if result["success"]:
+                        label = "Preview" if dry_run else "Saved"
+                        st.success(f"✅ {label} — {result['count']} players {'would be ' if dry_run else ''}written")
+                        for team, players in result.get("players", {}).items():
+                            st.write(f"**{team}:** {', '.join(players)}")
+                    else:
+                        st.error("Could not parse XI. Check the format and try again.")
+
+                    with st.expander("Parse log"):
+                        for line in result.get("log", []):
+                            st.text(line)
+
+                except Exception as e:
+                    st.error(f"Parse error: {e}")
+
+        st.divider()
+
+        # ── SECTION 3: Current XI display ─────────────────────
+        st.markdown("#### 3. Current XI in database")
+
+        existing = pconn.execute("""
+            SELECT xi.*, p.role, p.bowling_style
+            FROM playing_xi xi
+            LEFT JOIN players p ON xi.player_id = p.player_id
+            WHERE xi.match_id=?
+            ORDER BY xi.team, xi.batting_position NULLS LAST
+        """, (sm_xi["match_id"],)).fetchall()
+
+        if existing:
+            import pandas as pd
+            xi_df = pd.DataFrame([{
+                "Team":      r["team"],
+                "Player":    r["player_name"],
+                "Role":      r["role"] or "—",
+                "Style":     r["bowling_style"] or "—",
+                "Available": "✅" if r["is_available"] else "❌",
+                "©":         "©" if r["is_captain"] else "",
+                "🧤":        "🧤" if r["is_keeper"] else "",
+                "Source":    r["source"] or "manual",
+                "Note":      r["injury_note"] or "",
+            } for r in existing])
+            st.dataframe(xi_df, width="stretch", hide_index=True)
+
+            # Source badge
+            sources = set(r["source"] for r in existing if r["source"])
+            for src in sources:
+                if src == "auto-scraped":
+                    st.caption("🌐 Fetched automatically from ESPNcricinfo")
+                elif src == "manual":
+                    st.caption("✏️ Entered manually")
+        else:
+            st.info(f"No XI entered yet for this match. Use the fetch button or paste text above.")
+
+        st.divider()
+
+        # ── SECTION 4: Mark injuries ───────────────────────────
+        st.markdown("#### 4. Mark injury / non-selection")
+        st.caption("Quick update after late changes — scratches the player from the signal calculation.")
+
+        all_players = pconn.execute(
+            "SELECT player_id, name, team FROM players ORDER BY team, name"
+        ).fetchall()
+        player_opts = {f"{p['name']} ({p['team']})": dict(p) for p in all_players}
+
+        col1, col2 = st.columns(2)
+        with col1:
+            sel_player = st.selectbox("Player", list(player_opts.keys()), key="xi_player")
+        with col2:
+            inj_note = st.text_input("Reason", placeholder="e.g. hamstring — late withdrawal", key="xi_note")
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            if st.button("❌ Mark OUT", key="xi_unavail", ):
+                p = player_opts[sel_player]
+                pconn.execute("""
+                    INSERT OR REPLACE INTO playing_xi
+                    (match_id, match_date, team, player_id, player_name,
+                     is_available, injury_note, source)
+                    VALUES (?,?,?,?,?,0,?,'manual')
+                """, (sm_xi["match_id"], sm_xi["date"],
+                      p["team"], p["player_id"], p["name"],
+                      inj_note or "unavailable"))
+                pconn.commit()
+                st.error(f"❌ {p['name']} marked OUT")
+                st.rerun()
+
+        with col2:
+            if st.button("✅ Mark available", key="xi_avail", ):
+                p = player_opts[sel_player]
+                pconn.execute("""
+                    UPDATE playing_xi SET is_available=1, injury_note=NULL
+                    WHERE match_id=? AND player_id=?
+                """, (sm_xi["match_id"], p["player_id"]))
+                pconn.commit()
+                st.success(f"✅ {p['name']} marked available")
+                st.rerun()
+
+        with col3:
+            if st.button("🗑 Clear all XI", key="xi_clear", ):
+                pconn.execute("DELETE FROM playing_xi WHERE match_id=?", (sm_xi["match_id"],))
+                pconn.commit()
+                st.warning("Cleared XI for this match")
+                st.rerun()
+
+    pconn.close()
 
 # ══════════════════════════════════════════════════════════════════════════
 # PAGE: BANKROLL TRACKER
