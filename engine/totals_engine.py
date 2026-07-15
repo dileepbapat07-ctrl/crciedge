@@ -104,24 +104,35 @@ def get_conn():
 def get_venue_stats(venue_id, fmt, gender):
     conn = get_conn()
     # Map T20I → T20 for venue lookup (same pitches)
-    lookup_fmt = "T20" if fmt == "T20I" else fmt
-    row = conn.execute("""
-        SELECT avg_first_innings, avg_second_innings, matches_played,
-               highest_score, lowest_score, avg_powerplay_score,
-               avg_death_score, toss_win_bat_pct, bat_first_win_pct
-        FROM venue_stats
-        WHERE venue_id=? AND format=? AND gender=?
-    """, (venue_id, lookup_fmt, gender)).fetchone()
+    # Try both male/female gender values
+    lookup_fmts = ["T20", "T20I"] if fmt in ("T20", "T20I") else [fmt]
+    lookup_genders = [gender, "male", "female"]
 
+    row = None
+    for lf in lookup_fmts:
+        for lg in lookup_genders:
+            row = conn.execute("""
+                SELECT avg_first_innings, avg_second_innings, matches_played,
+                       highest_score, lowest_score, avg_powerplay_score,
+                       avg_death_score, toss_win_bat_pct, bat_first_win_pct
+                FROM venue_stats
+                WHERE venue_id=? AND format=? AND gender=?
+                ORDER BY matches_played DESC LIMIT 1
+            """, (venue_id, lf, lg)).fetchone()
+            if row and row["avg_first_innings"]:
+                conn.close()
+                return dict(row)
+
+    # Final fallback — any format at this venue
     if not row:
-        # Try any gender at this venue
         row = conn.execute("""
             SELECT avg_first_innings, avg_second_innings, matches_played,
                    highest_score, lowest_score, avg_powerplay_score,
                    avg_death_score, toss_win_bat_pct, bat_first_win_pct
             FROM venue_stats
-            WHERE venue_id=? AND format=?
-        """, (venue_id, lookup_fmt)).fetchone()
+            WHERE venue_id=?
+            ORDER BY matches_played DESC LIMIT 1
+        """, (venue_id,)).fetchone()
 
     conn.close()
     return dict(row) if row else None
