@@ -393,78 +393,156 @@ if page == "📅 Daily brief":
 # ══════════════════════════════════════════════════════════════════════════
 elif page == "🎯 Decision engine":
     st.title("🎯 Decision engine")
-    st.markdown("Enter match details to get a real-time Kelly stake and verdict.")
     st.divider()
 
-    col1, col2 = st.columns([1, 1])
+    conn = get_db()
 
-    with col1:
-        st.subheader("Market inputs")
-        odds  = st.slider("Decimal odds", 1.40, 3.50, 2.08, 0.01,
-                          format="%.2f")
-        wp    = st.slider("Your win probability (%)", 30, 75, 55) / 100
-        bk_e  = st.slider("Bankroll (€)", 1000, 80000, int(bankroll), 100,
-                          format="€%d")
-        ph_e  = st.radio("Phase", [1, 2],
-                         format_func=lambda x: f"Phase {x} ({'¼' if x==1 else '⅛'} Kelly)",
-                         horizontal=True, index=ph - 1)
+    # ── Optional: pick a match from schedule to pre-fill ──────
+    st.subheader("Step 1 — Pick a match (optional)")
+    st.caption("Select from schedule to auto-fill team names, or skip and enter manually below.")
 
-        st.subheader("Condition factors")
-        form    = st.slider("Team form (1–10)", 1.0, 10.0, 7.0, 0.5)
-        h2h_s   = st.slider("H2H / ELO factor (1–10)", 1.0, 10.0, 6.0, 0.5)
-        weather = st.slider("Weather (1–10)", 1, 10, 9)
-        players = st.slider("Player availability (1–10)", 1, 10, 8)
+    matches_de = conn.execute("""
+        SELECT match_id, date, step, label, team_a, team_b,
+               format, category, venue_id, gender
+        FROM matches ORDER BY date, step
+    """).fetchall()
 
-    with col2:
-        st.subheader("Engine output")
-        stake, ev, kf_pct = kelly(odds, wp, bk_e, ph_e)
-        conf = confidence(ev, form, h2h_s, weather, players)
-        v, vc = verdict(conf, ev)
-        impl = round(1 / odds * 100, 1)
-        edge = round(wp * 100 - impl, 1)
+    de_opts = {"— Enter manually —": None}
+    de_opts.update({
+        f"Step {m['step']:>3} | {m['date']} | {m['team_a']} vs {m['team_b']} [{m['format']}]":
+        dict(m) for m in matches_de
+    })
 
-        # Verdict box
-        if v == "BET":
-            st.success(f"### ✅ {v}")
-        elif v == "REDUCE":
-            st.warning(f"### ⚡ {v} STAKE")
-        else:
-            st.info(f"### ⏸ {v}")
+    sel_de = st.selectbox("Select match", list(de_opts.keys()), key="de_match")
+    sel_m  = de_opts[sel_de]
 
-        # Metrics
-        m1, m2 = st.columns(2)
-        m1.metric("Recommended stake", f"€{stake:,.2f}", f"{kf_pct:.1f}% of bankroll")
-        m2.metric("Expected value", f"{ev:+.1f}%",
-                  "Positive edge ✓" if ev > 0 else "No edge ✗")
+    # Pre-fill defaults from selected match
+    if sel_m:
+        default_ta  = sel_m["team_a"]
+        default_tb  = sel_m["team_b"]
+        default_fmt = sel_m["format"]
+        # Get ELO-based win probability
+        ra = get_elo(sel_m["team_a"], "male", sel_m["format"])
+        rb = get_elo(sel_m["team_b"], "male", sel_m["format"])
+        default_wp = int(round(elo_win_prob(ra, rb) * 100))
+        default_wp = max(30, min(75, default_wp))
+    else:
+        default_ta, default_tb, default_fmt = "India", "England", "ODI"
+        default_wp = 55
 
-        m3, m4 = st.columns(2)
-        m3.metric("Confidence score", f"{conf}/100",
-                  "Above BET threshold" if conf >= 72 else
-                  "Above REDUCE threshold" if conf >= 52 else "Below threshold")
-        m4.metric("Your edge over market", f"{edge:+.1f}%",
-                  f"Mkt implied: {impl}%")
+    st.divider()
+    st.subheader("Step 2 — Enter market details")
 
-        m5, m6 = st.columns(2)
-        m5.metric("Profit if win", f"+€{round(stake * (odds-1), 2):,.2f}")
-        m6.metric("Loss if lose", f"-€{stake:,.2f}")
+    # ── INPUT SECTION — full width, not hidden in columns ─────
+    c1, c2 = st.columns(2)
+    with c1:
+        odds = st.number_input(
+            "Betfair/bookmaker odds (decimal)",
+            min_value=1.10, max_value=20.0, value=2.08, step=0.01, format="%.2f",
+            help="e.g. 2.08 means you win €1.08 for every €1 staked"
+        )
+        wp = st.slider(
+            "Your estimated win probability (%)",
+            min_value=30, max_value=75, value=default_wp, step=1,
+            help="Based on ELO, form, H2H. Auto-filled if you picked a match above."
+        )
+        bk_e = st.number_input(
+            "Bankroll (€)",
+            min_value=100.0, max_value=500000.0,
+            value=float(int(bankroll)), step=100.0, format="%.2f"
+        )
+        ph_e = st.radio(
+            "Phase",
+            [1, 2],
+            format_func=lambda x: f"Phase {x} — {'¼ Kelly (2%/bet)' if x==1 else '⅛ Kelly (1%/bet)'}",
+            horizontal=True,
+            index=ph - 1
+        )
 
-        # Confidence bar
+    with c2:
+        st.markdown("**Condition factors** (1 = very poor · 10 = excellent)")
+        form    = st.slider("Team form",            1.0, 10.0, 7.0, 0.5)
+        h2h_s   = st.slider("H2H / ELO advantage", 1.0, 10.0, 6.0, 0.5)
+        weather = st.slider("Weather conditions",  1,   10,   9,   1)
+        players = st.slider("Player availability", 1,   10,   8,   1)
+
+        if sel_m:
+            # Auto-fetch ELO factor
+            ra = get_elo(sel_m["team_a"], "male", sel_m["format"])
+            rb = get_elo(sel_m["team_b"], "male", sel_m["format"])
+            elo_f = elo_factor(ra - rb)
+            st.caption(
+                f"ELO: {sel_m['team_a']} **{ra:.0f}** · "
+                f"{sel_m['team_b']} **{rb:.0f}** · "
+                f"H2H factor auto-suggested: **{elo_f:.1f}/10**"
+            )
+
+    st.divider()
+    st.subheader("Step 3 — Engine output")
+
+    # ── COMPUTE ────────────────────────────────────────────────
+    wp_f  = wp / 100
+    stake, ev, kf_pct = kelly(odds, wp_f, bk_e, ph_e)
+    conf  = confidence(ev, form, h2h_s, weather, players)
+    v, vc = verdict(conf, ev)
+    impl  = round(1 / odds * 100, 1)
+    edge  = round(wp_f * 100 - impl, 1)
+
+    # ── VERDICT ────────────────────────────────────────────────
+    if v == "BET":
+        st.success(f"## ✅ BET  ·  Stake €{stake:,.2f}  ·  EV {ev:+.1f}%  ·  Confidence {conf}/100")
+    elif v == "REDUCE":
+        st.warning(f"## ⚡ REDUCE STAKE  ·  Stake €{stake:,.2f}  ·  EV {ev:+.1f}%  ·  Confidence {conf}/100")
+    else:
+        st.info(f"## ⏸ SKIP  ·  EV {ev:+.1f}%  ·  Confidence {conf}/100  ·  No positive edge")
+
+    st.progress(conf / 100, text=f"Confidence {conf}/100  (BET threshold: 72)")
+
+    # ── METRICS ────────────────────────────────────────────────
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    m1.metric("Stake",         f"€{stake:,.2f}")
+    m2.metric("Expected value", f"{ev:+.1f}%",
+              "Edge ✓" if ev > 0 else "No edge ✗")
+    m3.metric("Confidence",    f"{conf}/100")
+    m4.metric("Your edge",     f"{edge:+.1f}%",
+              f"Mkt: {impl}%")
+    m5.metric("Profit if win", f"+€{round(stake*(odds-1),2):,.2f}")
+    m6.metric("Loss if lose",  f"-€{stake:,.2f}")
+
+    # ── FACTOR TABLE ───────────────────────────────────────────
+    st.divider()
+    import pandas as pd
+    fdf = pd.DataFrame([
+        {"Factor":"Value edge (EV)", "Score": round(min(10,max(0,5+ev*0.15)),1), "Weight":"22%", "Contribution": round(min(10,max(0,5+ev*0.15))*0.22,2)},
+        {"Factor":"Team form",       "Score": form,    "Weight":"14%", "Contribution": round(form*0.14,2)},
+        {"Factor":"H2H / ELO",       "Score": h2h_s,   "Weight":"10%", "Contribution": round(h2h_s*0.10,2)},
+        {"Factor":"Weather",         "Score": weather, "Weight":"10%", "Contribution": round(weather*0.10,2)},
+        {"Factor":"Players",         "Score": players, "Weight":"10%", "Contribution": round(players*0.10,2)},
+        {"Factor":"Market quality",  "Score": 8.5,     "Weight":"8%",  "Contribution": round(8.5*0.08,2)},
+    ])
+    st.dataframe(fdf, width="stretch", hide_index=True,
+                 column_config={
+                     "Score": st.column_config.ProgressColumn(
+                         "Score", min_value=0, max_value=10, format="%.1f"),
+                     "Contribution": st.column_config.NumberColumn(
+                         "Contribution", format="%.2f"),
+                 })
+
+    # ── IN-PLAY GUIDANCE ──────────────────────────────────────
+    if v == "BET" and sel_m:
         st.divider()
-        bar_col = "green" if conf >= 72 else "orange" if conf >= 52 else "red"
-        st.markdown(f"**Confidence breakdown** — {conf}/100")
-        st.progress(conf / 100)
-
-        # Factor chart
-        import pandas as pd
-        factors_df = pd.DataFrame({
-            "Factor": ["Value edge (EV)","Team form","H2H/ELO","Weather","Players","Market"],
-            "Score":  [
-                round(min(10, max(0, 5 + ev * 0.15)), 1),
-                form, h2h_s, weather, players, 8.5
-            ],
-            "Weight": ["22%","14%","10%","10%","10%","8%"]
-        })
-        st.dataframe(factors_df, width="stretch", hide_index=True)
+        st.subheader("In-play rules for this match")
+        c1, c2, c3 = st.columns(3)
+        max_inplay = round(bk_e * 0.05 - stake, 2)
+        with c1:
+            st.success(f"**Pre-match entry**\nStake €{stake:,.2f} now.\nExposure: {kf_pct:.1f}% of bankroll.")
+        with c2:
+            if max_inplay > 0:
+                st.warning(f"**Optional in-play add**\nMax €{max_inplay:,.2f} more at innings break.\nOnly if EV still positive.")
+            else:
+                st.warning("**No in-play capacity**\nAlready at 5% daily cap.")
+        with c3:
+            st.error("**Hard stop**\nNever add after 15 overs of the chase. One match = max 5% bankroll.")
 
 # ══════════════════════════════════════════════════════════════════════════
 # PAGE: OVER/UNDER TOTALS
