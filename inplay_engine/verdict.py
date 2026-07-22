@@ -222,7 +222,7 @@ def decide(state: MatchState) -> InPlayDecision:
             f"Edge {wp.edge:+.1%} but using WASP fallback "
             f"(thin data for this state). Don't ADD on uncertain data."
         )
-    elif wp.sample_size < MIN_SAMPLE:
+    elif wp.sample_size < MIN_SAMPLE_ADD:
         hold_reason = (
             f"Edge {wp.edge:+.1%} but only {wp.sample_size} historical matches "
             f"in this state. Need {MIN_SAMPLE_ADD}+ to act. HOLD."
