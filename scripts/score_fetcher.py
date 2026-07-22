@@ -76,94 +76,169 @@ def overs_to_balls(overs_str: str) -> int:
 def parse_score_from_text(text: str, team_a: str = "", team_b: str = "") -> ScoreResult:
     """
     Parse a score from any freeform text.
-    Handles:
-      "51/3 (7.3 ov)"
-      "England 258 all out (48.2 overs)"
-      "India 144/3 (14 balls)"   ← 100-ball format
-      "Target: 144, India need 93 runs from 56 balls"
+    Strict patterns to avoid false positives like "4/5 wickets" or "4/5 run rate".
+
+    Valid cricket score formats:
+      "51/3 (7.3 ov)"       — runs/wickets (overs)
+      "143/10 (99 balls)"   — all out
+      "258 all out (48.2)"  — all out with overs
+      "ENG: 125/3"          — team prefix
+      "157/4 (95b)"         — 100-ball format balls
     """
     r = ScoreResult()
     r.raw_text = text[:500]
 
-    # Score patterns: runs/wickets (overs)
-    patterns = [
-        # "51/3 (7.3 ov)" or "51/3 (44 balls)"
-        r"(\d{1,3})/(\d{1,2})\s*\(?\s*(\d{1,3}(?:\.\d)?)\s*(?:ov(?:ers?)?|balls?|b)\s*\)?",
-        # "258 all out (48.2)"
-        r"(\d{2,3})\s+(?:all\s+out|ao)\s*\(?\s*(\d{1,3}(?:\.\d)?)\s*(?:ov(?:ers?)?|balls?)?\s*\)?",
-        # "144/3" with no overs
-        r"(\d{1,3})/(\d{1,2})",
-    ]
+    # ── False positive guard ──────────────────────────────────
+    # Skip if the X/Y is followed by "wickets", "run rate", "rr", "wkts" nearby
+    def is_false_positive(match_start, text):
+        """Check if score match is actually a wicket count or run rate."""
+        context_after = text[match_start:match_start+40].lower()
+        false_triggers = ["wicket", "wkts", "wkt", "run rate", "/over", " rr ", "for "]
+        return any(t in context_after for t in false_triggers)
 
-    for pat in patterns:
-        matches = re.findall(pat, text, re.IGNORECASE)
-        if matches:
-            m = matches[-1]  # take the most recent score
-            if len(m) >= 2:
-                r.score   = int(m[0])
-                r.wickets = int(m[1]) if len(m) > 1 and m[1] else 0
-                if len(m) > 2 and m[2]:
-                    r.overs_str = m[2]
-                    r.balls_done = overs_to_balls(m[2])
-                r.success = True
-                r.source  = "text_parse"
-                break
+    # ── Strategy 1: Full score with overs — most reliable ─────
+    # "51/3 (7.3 ov)" or "51/3 (44 balls)" or "51/3 (7.3)"
+    full_pattern = re.compile(
+        r'(\d{1,3})/(\d{1,2})\s*\(\s*(\d{1,3})(?:\.([0-6]))?\s*(ov(?:ers?)?|o|balls?|b)\s*\)',
+        re.IGNORECASE
+    )
+    for m in full_pattern.finditer(text):
+        runs    = int(m.group(1))
+        wickets = int(m.group(2))
+        number  = int(m.group(3))
+        fraction= int(m.group(4)) if m.group(4) else 0
+        unit    = m.group(5).lower()
 
-    # Target / runs needed
+        if runs > 700 or wickets > 10:
+            continue
+        if runs < 1 and number == 0:
+            continue
+        if is_false_positive(m.end(), text):
+            continue
+
+        # Determine if unit is balls or overs
+        is_balls = unit.startswith('b') and not unit.startswith('bo')
+        if is_balls:
+            r.balls_done = number
+            r.overs_str  = f"{number//6}.{number%6}"
+        else:
+            r.overs_str  = f"{number}.{fraction}" if fraction else str(number)
+            r.balls_done = number * 6 + fraction
+
+        r.score   = runs
+        r.wickets = wickets
+        r.success = True
+        r.source  = "text_parse"
+        break
+
+    # ── Strategy 2: Score without overs — less reliable ───────
+    if not r.success:
+        # Must have context: team name OR preceded by colon/space-at-start-of-line
+        bare_pattern = re.compile(
+            r'(?:^|:\s*|(?:' + '|'.join([
+                re.escape(t) for t in
+                ["India","England","Australia","Pakistan","West Indies","New Zealand",
+                 "South Africa","Sri Lanka","Bangladesh","Afghanistan","Zimbabwe",
+                 "MI London","Welsh Fire","Southern Brave","Trent Rockets",
+                 "Birmingham Phoenix","Manchester Originals","Sunrisers","London Spirit",
+                 "Trinbago","Barbados","Guyana","Jamaica","St Kitts","Saint Lucia",
+                 "Antigua","Adelaide","Brisbane","Hobart","Melbourne","Perth","Sydney"]
+            ]) + r')\s+)(\d{2,3})/(\d{1,2})(?!\s*(?:ov|ball|run|wkt|wkts|wicket|over|rr))',
+            re.IGNORECASE | re.MULTILINE
+        )
+        for m in bare_pattern.finditer(text):
+            # Get the last group
+            groups = [g for g in m.groups() if g is not None]
+            if len(groups) < 2:
+                continue
+            runs_s, wkts_s = groups[-2], groups[-1]
+            try:
+                runs    = int(runs_s)
+                wickets = int(wkts_s)
+            except ValueError:
+                continue
+            if runs > 700 or wickets > 10 or runs < 5:
+                continue
+            r.score   = runs
+            r.wickets = wickets
+            r.success = True
+            r.source  = "text_parse"
+            break
+
+    # ── Strategy 3: "X all out (overs)" ──────────────────────
+    if not r.success:
+        ao = re.search(
+            r'(\d{2,3})\s+(?:all\s+out|ao|a/o)\s*\(?\s*(\d{1,3})(?:\.([0-6]))?\s*(?:ov(?:ers?)?|o)?\s*\)?',
+            text, re.IGNORECASE
+        )
+        if ao:
+            runs  = int(ao.group(1))
+            overs = int(ao.group(2))
+            balls_extra = int(ao.group(3)) if ao.group(3) else 0
+            if runs <= 700:
+                r.score      = runs
+                r.wickets    = 10
+                r.overs_str  = f"{overs}.{balls_extra}" if balls_extra else str(overs)
+                r.balls_done = overs * 6 + balls_extra
+                r.success    = True
+                r.source     = "text_parse"
+
+    if not r.success:
+        return r
+
+    # ── Target / runs needed ──────────────────────────────────
     tgt = re.search(
-        r"(?:target|chasing|need[s]?|require[s]?)\s*[:\s]*(\d{2,3})",
+        r'(?:target|chasing|need[s]?|require[s]?)\s*[:\s]*(\d{2,3})',
         text, re.IGNORECASE
     )
     if tgt:
         r.target  = int(tgt.group(1))
         r.innings = 2
 
-    runs_needed = re.search(
-        r"need[s]?\s+(\d{1,3})\s+(?:more\s+)?runs?\s+(?:from|in|off)\s+(\d{1,3})\s+balls?",
+    rn = re.search(
+        r'need[s]?\s+(\d{1,3})\s+(?:more\s+)?runs?\s+(?:from|in|off)\s+(\d{1,3})\s+balls?',
         text, re.IGNORECASE
     )
-    if runs_needed:
-        r.runs_needed = int(runs_needed.group(1))
+    if rn:
+        r.runs_needed = int(rn.group(1))
         r.innings = 2
 
-    # Innings number
-    inn_m = re.search(r"(\d)(?:st|nd|rd|th)\s+innings?", text, re.IGNORECASE)
-    if inn_m:
-        r.innings = int(inn_m.group(1))
+    # ── Innings number ────────────────────────────────────────
+    inn = re.search(r'(\d)(?:st|nd|rd|th)\s+innings?', text, re.IGNORECASE)
+    if inn:
+        r.innings = int(inn.group(1))
 
-    # Toss
-    toss_m = re.search(
-        r"([\w\s]+?)\s+won\s+the\s+toss\s+and\s+(?:elected|chose)\s+to\s+(bat|field)",
+    # ── Toss ──────────────────────────────────────────────────
+    toss = re.search(
+        r'([\w\s]+?)\s+won\s+the\s+toss\s+and\s+(?:elected|chose)\s+to\s+(bat|field)',
         text, re.IGNORECASE
     )
-    if toss_m:
-        r.toss_winner = toss_m.group(1).strip()
-        r.toss_choice = toss_m.group(2).strip()
+    if toss:
+        r.toss_winner = toss.group(1).strip()
+        r.toss_choice = toss.group(2).strip()
 
-    # Result
-    result_m = re.search(
-        r"([\w\s]+?)\s+(?:won|beat|beats|defeated)\s+[\w\s]+?\s+by\s+[\w\s]+",
+    # ── Result ────────────────────────────────────────────────
+    result = re.search(
+        r'[\w\s]+?\s+(?:won|beat|defeated)\s+[\w\s]+?\s+by\s+[\w\d\s]+',
         text, re.IGNORECASE
     )
-    if result_m:
-        r.result_str  = result_m.group(0).strip()
+    if result:
+        r.result_str   = result.group(0).strip()
         r.match_status = "Complete"
 
-    # Batting team detection
-    if team_a and team_b:
-        ta_low = team_a.lower().split()[-1]
-        tb_low = team_b.lower().split()[-1]
-        if r.score > 0:
-            # Look for team name near the score in text
-            score_idx = text.find(str(r.score))
-            if score_idx >= 0:
-                ctx = text[max(0, score_idx-150):score_idx+50].lower()
-                if ta_low in ctx:
-                    r.batting_team = team_a
-                    r.bowling_team = team_b
-                elif tb_low in ctx:
-                    r.batting_team = team_b
-                    r.bowling_team = team_a
+    # ── Batting team ──────────────────────────────────────────
+    if team_a and team_b and r.score > 0:
+        score_idx = text.find(str(r.score))
+        if score_idx >= 0:
+            ctx = text[max(0, score_idx-150):score_idx+50].lower()
+            ta_word = team_a.lower().split()[-1]
+            tb_word = team_b.lower().split()[-1]
+            if ta_word in ctx:
+                r.batting_team = team_a
+                r.bowling_team = team_b
+            elif tb_word in ctx:
+                r.batting_team = team_b
+                r.bowling_team = team_a
 
     return r
 
