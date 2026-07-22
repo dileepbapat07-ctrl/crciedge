@@ -1117,7 +1117,8 @@ elif page == "🔴 Match dashboard":
                         try:
                             sys.path.insert(0, os.path.join(ROOT, "scripts"))
                             from score_fetcher import fetch_live_score
-                            res = fetch_live_score(ta, tb, match["date"], fmt)
+                            api_key = st.secrets.get("ANTHROPIC_API_KEY","") if hasattr(st,"secrets") else ""
+                            res = fetch_live_score(ta, tb, match["date"], fmt, api_key=api_key)
                             if res.success:
                                 fetched = dict(score_d)
                                 fetched["score"]      = res.score
@@ -1137,7 +1138,7 @@ elif page == "🔴 Match dashboard":
                                     ref_status.info(f"🏆 {res.result_str}")
                             else:
                                 ref_status.warning(
-                                    f"Could not fetch automatically. Enter manually below."
+                                    f"⚠️ Could not fetch automatically (external APIs blocked on Streamlit Cloud). Add ANTHROPIC_API_KEY to Streamlit secrets for auto-fetch, or paste the score below."
                                 )
                         except Exception as e:
                             ref_status.warning(f"Fetch error: {e}")
