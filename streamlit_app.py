@@ -144,12 +144,14 @@ with st.sidebar:
         "📅 Daily brief",
         "🎯 Decision engine",
         "📊 Over/Under totals",
+        "👁 In-play engine",
         "👤 Player analytics",
         "📈 Bankroll tracker",
         "🧬 ELO ratings",
         "🛡 Risk framework",
         "📋 Match schedule",
         "✏️ Log result",
+        "⚙️ Settings & updates",
     ])
     st.divider()
     st.caption(f"Step {st.session_state.step}/193 · Phase {phase}")
@@ -758,6 +760,259 @@ elif page == "📊 Over/Under totals":
 
                 **Venue avg:** {result.venue_avg_first:.0f} (1st innings) from {result.venue_matches} matches
                 """)
+
+# ══════════════════════════════════════════════════════════════════════════
+# PAGE: IN-PLAY ENGINE
+# ══════════════════════════════════════════════════════════════════════════
+elif page == "👁 In-play engine":
+    st.title("👁 In-play engine")
+    st.markdown(
+        "Enter the live match state to get an **ADD / HOLD / HEDGE / EXIT** verdict. "
+        "Blends historical win frequencies (Approach B — Cricsheet 2024+) with ELO team ratings."
+    )
+    st.divider()
+
+    sys.path.insert(0, os.path.join(ROOT, "inplay_engine"))
+
+    try:
+        from wp_lookup import MatchState, lookup
+        from verdict import decide, print_decision
+        ENGINE_LOADED = True
+    except Exception as e:
+        st.error(f"In-play engine not loaded: {e}")
+        ENGINE_LOADED = False
+
+    if ENGINE_LOADED:
+
+        conn = get_db()
+
+        # ── Match selector ─────────────────────────────────────
+        st.subheader("1. Select the match in progress")
+        matches_ip = conn.execute("""
+            SELECT match_id, date, step, label, team_a, team_b,
+                   format, venue_id, gender, category
+            FROM matches ORDER BY date DESC, step DESC
+        """).fetchall()
+
+        ip_opts = {
+            f"Step {m['step']} | {m['date']} | {m['team_a']} vs {m['team_b']} [{m['format']}]":
+            dict(m) for m in matches_ip
+        }
+        sel_ip = st.selectbox("Match", list(ip_opts.keys()), key="ip_match")
+        sm_ip  = ip_opts[sel_ip]
+
+        st.divider()
+        st.subheader("2. Enter live match state")
+        st.caption("Update these values from the live scoreboard or Cricbuzz app")
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            innings = st.radio("Innings", [1, 2], horizontal=True,
+                               format_func=lambda x: f"{'1st' if x==1 else '2nd'} innings",
+                               key="ip_inn")
+            batting_team = st.selectbox("Batting team",
+                [sm_ip["team_a"], sm_ip["team_b"]], key="ip_bat")
+            bowling_team = sm_ip["team_b"] if batting_team == sm_ip["team_a"] else sm_ip["team_a"]
+            st.caption(f"Bowling: **{bowling_team}**")
+
+        with col2:
+            fmt_map = {"T20I":"T20I","T20":"T20","ODI":"ODI","100b":"100b","Test":"Test"}
+            fmt_ip  = fmt_map.get(sm_ip["format"], "T20")
+            total_balls = {"T20":120,"T20I":120,"100b":100,"ODI":300}.get(fmt_ip, 120)
+
+            score = st.number_input("Current score (runs)", 0, 500, 51, 1, key="ip_score")
+            wickets = st.number_input("Wickets lost", 0, 9, 3, 1, key="ip_wkts")
+            balls_done = st.number_input(
+                f"Balls completed (of {total_balls})",
+                0, total_balls, 44, 1, key="ip_balls"
+            )
+
+        with col3:
+            target = None
+            if innings == 2:
+                target = st.number_input("Target (runs to win)", 50, 600, 144, 1, key="ip_target")
+            betfair_odds = st.number_input(
+                f"Betfair odds on {batting_team}",
+                1.01, 50.0, 2.95, 0.01, format="%.2f", key="ip_odds"
+            )
+
+        st.divider()
+        st.subheader("3. Your pre-match position")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            pre_stake = st.number_input("Pre-match stake (€)", 0.0, 10000.0,
+                                        199.0, 1.0, key="ip_pstake")
+        with col2:
+            pre_odds  = st.number_input("Pre-match odds taken", 1.01, 20.0,
+                                        1.95, 0.01, format="%.2f", key="ip_podds")
+        with col3:
+            pre_team  = st.selectbox("Bet was on",
+                [sm_ip["team_a"], sm_ip["team_b"], "— No pre-match bet —"],
+                key="ip_pteam")
+
+        gender_ip = "male" if sm_ip.get("gender","male") in ("male","Men's") else "female"
+
+        if st.button("▶ Get in-play verdict", type="primary", key="ip_run"):
+            state = MatchState(
+                format          = fmt_ip,
+                innings         = innings,
+                batting_team    = batting_team,
+                bowling_team    = bowling_team,
+                balls_completed = balls_done,
+                score           = score,
+                wickets_lost    = wickets,
+                target          = target,
+                betfair_odds    = betfair_odds,
+                pre_match_stake = pre_stake if pre_team != "— No pre-match bet —" else 0,
+                pre_match_odds  = pre_odds,
+                pre_match_team  = pre_team if pre_team != "— No pre-match bet —" else batting_team,
+                bankroll        = bankroll,
+                phase           = ph,
+                gender          = gender_ip,
+            )
+
+            wp = lookup(state)
+            d  = decide(state)
+
+            # ── WP breakdown ───────────────────────────────────
+            st.divider()
+            st.subheader("Win probability breakdown")
+
+            balls_rem = total_balls - balls_done
+            c1,c2,c3,c4,c5 = st.columns(5)
+            c1.metric("Balls remaining", balls_rem)
+            c2.metric("Wickets in hand", 10 - wickets)
+            if target:
+                rr = round((target - score) / (balls_rem / 6), 2) if balls_rem > 0 else 0
+                c3.metric("Runs needed", target - score)
+                c4.metric("Required RR", f"{rr:.1f}")
+                c5.metric("Pressure", f"{wp.pressure_index:.1f}×",
+                          "High" if wp.pressure_index > 1.4 else
+                          "Medium" if wp.pressure_index > 1.1 else "Low")
+
+            st.divider()
+            import pandas as pd
+            wp_df = pd.DataFrame([
+                {"Source": "Historical (Cricsheet 2024+)",
+                 "Win %": f"{wp.historical_wp:.1%}",
+                 "Sample": wp.sample_size,
+                 "Confidence": wp.confidence,
+                 "Method": "WASP fallback" if wp.fallback_used else "Lookup table"},
+                {"Source": f"ELO ({batting_team} {wp.elo_batting:.0f} vs {bowling_team} {wp.elo_bowling:.0f})",
+                 "Win %": f"{wp.elo_wp:.1%}",
+                 "Sample": "—",
+                 "Confidence": "high",
+                 "Method": "ELO formula"},
+                {"Source": "BLENDED (70% hist + 30% ELO)",
+                 "Win %": f"{wp.blended_wp:.1%}",
+                 "Sample": "—",
+                 "Confidence": "—",
+                 "Method": "Combined"},
+                {"Source": f"Betfair implied (@ {betfair_odds})",
+                 "Win %": f"{wp.implied_wp:.1%}",
+                 "Sample": "—",
+                 "Confidence": "—",
+                 "Method": "Market"},
+            ])
+            st.dataframe(wp_df, width="stretch", hide_index=True)
+
+            edge_col = "#1DB87A" if wp.edge > 0 else "#E84040"
+            st.markdown(
+                f"<div style='padding:10px 14px;background:var(--card);border:1px solid var(--bdr);"
+                f"border-radius:8px;font-size:14px'>"
+                f"Edge: <strong style='color:{edge_col}'>{wp.edge:+.1%}</strong> "
+                f"({batting_team} model {wp.blended_wp:.1%} vs Betfair {wp.implied_wp:.1%})"
+                f"</div>",
+                unsafe_allow_html=True
+            )
+
+            # ── Verdict ────────────────────────────────────────
+            st.divider()
+            st.subheader("Verdict")
+
+            if d.verdict == "ADD":
+                st.success(f"""
+### ✅ ADD — Place €{d.add_stake:.2f} on {batting_team} @ {d.add_odds}
+
+**EV: {d.add_ev_pct:+.1f}%** · Edge: {wp.edge:+.1%} · Sample: {wp.sample_size} matches
+
+{d.reason}
+
+**Combined P&L:**
+- If {batting_team} wins: **+€{d.pnl_if_batting_wins:.2f}**
+- If {batting_team} loses: **-€{abs(d.pnl_if_batting_loses):.2f}**
+- Daily cap remaining after adding: **€{d.daily_cap_remaining - d.add_stake:.2f}**
+                """)
+
+            elif d.verdict == "HEDGE":
+                st.info(f"""
+### 🔄 HEDGE — Green up on Betfair
+
+Lay **€{d.lay_stake:.2f}** on {batting_team} at odds {betfair_odds}
+
+**Guaranteed profit: €{d.guaranteed_profit:.2f}** — locked in regardless of result.
+
+Use Betfair's "**Green All**" function to automatically calculate the lay stake.
+
+{d.reason}
+                """)
+
+            elif d.verdict == "EXIT":
+                st.error(f"""
+### 🛑 EXIT — Close position early
+
+{d.reason}
+
+Current exposure: **€{pre_stake:.2f}** — take the loss now rather than ride to the end.
+                """)
+
+            else:  # HOLD
+                st.warning(f"""
+### ⏸ HOLD — No action required
+
+{d.reason}
+
+Your pre-match bet of **€{pre_stake:.2f} @ {pre_odds}** is still valid.
+Let the match play out.
+
+P&L if {batting_team} wins: **+€{d.pnl_if_batting_wins:.2f}**
+P&L if {batting_team} loses: **-€{abs(d.pnl_if_batting_loses):.2f}**
+                """)
+
+            # ── Scenario analysis ──────────────────────────────
+            st.divider()
+            st.subheader("What-if scenarios")
+            st.caption("How the verdict changes at different odds levels")
+
+            odds_range = [1.10, 1.20, 1.30, 1.50, 1.75, 2.00, 2.20, 2.50, 3.00, 4.00]
+            scen_rows = []
+            for test_odds in odds_range:
+                s_test = MatchState(
+                    format=fmt_ip, innings=innings,
+                    batting_team=batting_team, bowling_team=bowling_team,
+                    balls_completed=balls_done, score=score,
+                    wickets_lost=wickets, target=target,
+                    betfair_odds=test_odds,
+                    pre_match_stake=pre_stake,
+                    pre_match_odds=pre_odds,
+                    pre_match_team=pre_team if pre_team != "— No pre-match bet —" else batting_team,
+                    bankroll=bankroll, phase=ph, gender=gender_ip,
+                )
+                dtest = decide(s_test)
+                implied = round(1/test_odds*100, 1)
+                edge_t  = round((wp.blended_wp - 1/test_odds)*100, 1)
+                scen_rows.append({
+                    "Betfair odds": test_odds,
+                    "Implied WP": f"{implied}%",
+                    "Our model WP": f"{wp.blended_wp:.1%}",
+                    "Edge": f"{edge_t:+.1f}%",
+                    "Verdict": dtest.verdict,
+                    "Action": (f"Add €{dtest.add_stake:.0f}" if dtest.verdict=="ADD"
+                               else f"Lay €{dtest.lay_stake:.0f}" if dtest.verdict=="HEDGE"
+                               else dtest.verdict),
+                })
+            scen_df = pd.DataFrame(scen_rows)
+            st.dataframe(scen_df, width="stretch", hide_index=True)
 
 # ══════════════════════════════════════════════════════════════════════════
 # PAGE: PLAYER ANALYTICS
@@ -1930,3 +2185,474 @@ elif page == "✏️ Log result":
         c4.metric("Total P&L", f"€{total_pnl:+,.2f}")
     else:
         st.info("No bets logged yet. Use the form above to record your first result.")
+
+# ══════════════════════════════════════════════════════════════════════════
+# PAGE: SETTINGS & UPDATES
+# ══════════════════════════════════════════════════════════════════════════
+elif page == "⚙️ Settings & updates":
+    import datetime as dt
+    import subprocess
+
+    st.title("⚙️ Settings & updates")
+    st.markdown(
+        "Press buttons to refresh each component of the engine. "
+        "Recommended: run **Full Sunday refresh** once a week."
+    )
+    st.divider()
+
+    conn = get_db()
+
+    # ── DB status summary ──────────────────────────────────────
+    st.subheader("📊 Current database status")
+
+    def db_stat(sql, label):
+        try:
+            return conn.execute(sql).fetchone()[0]
+        except Exception:
+            return "—"
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("ELO ratings",    db_stat("SELECT COUNT(*) FROM elo_ratings WHERE matches_played > 0", ""))
+    col2.metric("ELO history",    db_stat("SELECT COUNT(*) FROM elo_history", ""))
+    col3.metric("H2H records",    db_stat("SELECT COUNT(*) FROM h2h_full", ""))
+    col4.metric("Matches in DB",  db_stat("SELECT COUNT(*) FROM matches", ""))
+
+    col1, col2, col3, col4 = st.columns(4)
+    last_elo = db_stat("SELECT MAX(last_updated) FROM elo_ratings", "")
+    last_h2h = db_stat("SELECT MAX(last_updated) FROM h2h_full", "")
+    col1.metric("Last ELO update", str(last_elo)[:10] if last_elo else "never")
+    col2.metric("Last H2H update", str(last_h2h)[:10] if last_h2h else "never")
+
+    # In-play DB
+    try:
+        ip_conn = sqlite3.connect(os.path.join(ROOT, "db", "inplay_engine.db"))
+        n_cells = ip_conn.execute("SELECT COUNT(*) FROM wp_lookup").fetchone()[0]
+        last_built = ip_conn.execute("SELECT MAX(built_at) FROM wp_build_log").fetchone()[0]
+        ip_conn.close()
+        col3.metric("WP table cells", f"{n_cells:,}")
+        col4.metric("WP table built", str(last_built)[:10] if last_built else "never")
+    except Exception:
+        col3.metric("WP table cells", "—")
+        col4.metric("WP table built", "—")
+
+    st.divider()
+
+    # ── Individual update buttons ──────────────────────────────
+    st.subheader("🔧 Individual updates")
+
+    # ── 1. ELO rebuild ────────────────────────────────────────
+    with st.expander("🧬 Rebuild ELO ratings (from 2024)", expanded=False):
+        st.markdown(
+            "Rebuilds all ELO ratings and H2H records from 2024 data in the match log. "
+            "Run after adding real Cricsheet data, or after manually logging multiple results."
+        )
+        col1, col2 = st.columns([2, 1])
+        with col1:
+            cutoff = st.selectbox("Data cutoff year", [2024, 2023, 2022],
+                                  index=0, key="elo_cutoff")
+        with col2:
+            st.markdown("<br>", unsafe_allow_html=True)
+            run_elo = st.button("🔄 Rebuild ELO", key="btn_elo", type="primary")
+
+        if run_elo:
+            with st.spinner("Rebuilding ELO ratings from scratch..."):
+                try:
+                    cutoff_date = f"{cutoff}-01-01"
+                    # Reset ratings
+                    conn.execute("UPDATE elo_ratings SET rating=1500.0, matches_played=0, wins=0, losses=0")
+                    # Delete history before cutoff
+                    conn.execute("DELETE FROM elo_history WHERE match_date < ?", (cutoff_date,))
+                    conn.execute("DELETE FROM elo_match_log WHERE match_date < ?", (cutoff_date,))
+
+                    # Rebuild from history
+                    ratings = {}
+                    history = conn.execute("""
+                        SELECT team_id, gender, format, result, match_date,
+                               rating_after, k_factor
+                        FROM elo_history WHERE match_date >= ?
+                        ORDER BY match_date
+                    """, (cutoff_date,)).fetchall()
+
+                    for h in history:
+                        key = (h[0], h[1], h[2])
+                        ratings[key] = h[5]  # rating_after
+
+                    for (team, gender, fmt), rating in ratings.items():
+                        wl = conn.execute("""
+                            SELECT SUM(CASE WHEN result='win' THEN 1 ELSE 0 END),
+                                   SUM(CASE WHEN result='loss' THEN 1 ELSE 0 END),
+                                   COUNT(*)
+                            FROM elo_history
+                            WHERE team_id=? AND gender=? AND format=?
+                              AND match_date >= ?
+                        """, (team, gender, fmt, cutoff_date)).fetchone()
+
+                        intl_teams = {'India','England','Australia','Pakistan',
+                                      'West Indies','New Zealand','South Africa',
+                                      'Sri Lanka','Bangladesh','Afghanistan','Zimbabwe','Ireland',
+                                      'India Women','England Women','Australia Women'}
+                        team_type = 'international' if team in intl_teams else 'franchise'
+
+                        conn.execute("""
+                            INSERT OR REPLACE INTO elo_ratings
+                            (team_id, team_type, gender, format, rating,
+                             matches_played, wins, losses, peak_rating, last_updated)
+                            VALUES (?,?,?,?,?,?,?,?,?,datetime('now'))
+                        """, (team, team_type, gender, fmt, round(rating, 2),
+                              wl[2] or 0, wl[0] or 0, wl[1] or 0, round(rating, 2)))
+
+                    conn.commit()
+                    n_updated = len(ratings)
+                    st.success(f"✅ ELO rebuilt — {n_updated} team-format ratings updated from {cutoff}+ data")
+
+                    # Show top 5
+                    top = conn.execute("""
+                        SELECT team_id, format, rating FROM elo_ratings
+                        WHERE matches_played > 0 AND format='ODI' AND gender='male'
+                        ORDER BY rating DESC LIMIT 5
+                    """).fetchall()
+                    if top:
+                        import pandas as pd
+                        st.dataframe(pd.DataFrame(top, columns=["Team","Format","ELO"]),
+                                     width="stretch", hide_index=True)
+                except Exception as e:
+                    st.error(f"ELO rebuild error: {e}")
+
+    # ── 2. Win probability table rebuild ──────────────────────
+    with st.expander("👁 Rebuild win probability table", expanded=False):
+        st.markdown(
+            "Rebuilds the in-play lookup table from Cricsheet data. "
+            "**Demo mode** uses synthetic data — works immediately with no files needed. "
+            "**Production mode** requires real Cricsheet CSVs uploaded to the server."
+        )
+        mode = st.radio("Build mode", ["Demo (no files needed)", "Production (Cricsheet CSVs)"],
+                        key="wp_mode", horizontal=True)
+        data_dir = ""
+        if "Production" in mode:
+            data_dir = st.text_input("Cricsheet CSV directory path",
+                                     placeholder="/path/to/cricsheet_csvs",
+                                     key="wp_dir")
+
+        col1, col2 = st.columns([2, 1])
+        with col1:
+            st.caption(
+                "Demo generates 3,200 simulated matches (~8,500 probability cells). "
+                "Production with real Cricsheet data generates 40,000+ cells with higher accuracy."
+            )
+        with col2:
+            run_wp = st.button("🔄 Rebuild WP table", key="btn_wp", type="primary")
+
+        if run_wp:
+            with st.spinner("Building win probability table... (this takes 1-3 minutes)"):
+                try:
+                    sys.path.insert(0, os.path.join(ROOT, "inplay_engine"))
+                    from build_wp_table import get_conn as ip_get_conn, build_demo, process_cricsheet
+
+                    ip_conn = ip_get_conn()
+
+                    if "Production" in mode and data_dir and os.path.exists(data_dir):
+                        process_cricsheet(data_dir, ip_conn)
+                        method = f"Cricsheet data from {data_dir}"
+                    else:
+                        build_demo(ip_conn)
+                        method = "Demo mode (synthetic 2024+ data)"
+
+                    n_cells = ip_conn.execute("SELECT COUNT(*) FROM wp_lookup").fetchone()[0]
+                    ip_conn.close()
+                    st.success(f"✅ Win probability table rebuilt — {n_cells:,} cells via {method}")
+
+                    # Show sample
+                    ip_conn2 = sqlite3.connect(os.path.join(ROOT, "db", "inplay_engine.db"))
+                    ip_conn2.row_factory = sqlite3.Row
+                    samples = ip_conn2.execute("""
+                        SELECT format, balls_remaining, wickets_lost,
+                               runs_needed, win_pct, sample_size, confidence
+                        FROM wp_lookup WHERE sample_size >= 30
+                        ORDER BY RANDOM() LIMIT 6
+                    """).fetchall()
+                    if samples:
+                        import pandas as pd
+                        sdf = pd.DataFrame([dict(s) for s in samples])
+                        sdf["win_pct"] = sdf["win_pct"].apply(lambda x: f"{x:.1f}%")
+                        st.dataframe(sdf, width="stretch", hide_index=True)
+                    ip_conn2.close()
+
+                except Exception as e:
+                    st.error(f"WP rebuild error: {e}")
+
+    # ── 3. Weather refresh ─────────────────────────────────────
+    with st.expander("🌤 Refresh weather data", expanded=False):
+        st.markdown(
+            "Fetches fresh weather forecasts from Open-Meteo (free, no API key) "
+            "for all matches in the next 7 days."
+        )
+        if st.button("🔄 Refresh weather", key="btn_wx", type="primary"):
+            with st.spinner("Fetching weather from Open-Meteo..."):
+                try:
+                    import importlib.util, json
+                    spec = importlib.util.spec_from_file_location(
+                        "fetch_weather",
+                        os.path.join(ROOT, "scripts", "03_fetch_weather.py")
+                    )
+                    mod = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(mod)
+
+                    today = dt.date.today().isoformat()
+                    week_end = (dt.date.today() + dt.timedelta(days=7)).isoformat()
+                    upcoming = conn.execute("""
+                        SELECT DISTINCT m.venue_id, m.date, v.latitude, v.longitude, v.name
+                        FROM matches m
+                        JOIN venues v ON v.venue_id = m.venue_id
+                        WHERE m.date BETWEEN ? AND ?
+                    """, (today, week_end)).fetchall()
+
+                    updated = 0
+                    failed  = []
+                    for row in upcoming:
+                        try:
+                            result = mod.fetch_weather(row[2], row[3], row[1])
+                            if result:
+                                conn.execute("""
+                                    INSERT OR REPLACE INTO weather
+                                    (venue_id, match_date, fetched_at, rain_prob_pct,
+                                     temp_celsius, condition, dl_risk)
+                                    VALUES (?,?,datetime('now'),?,?,?,?)
+                                """, (row[0], row[1],
+                                      result.get("rain_prob", 0),
+                                      result.get("temp", 20),
+                                      result.get("condition", "unknown"),
+                                      result.get("dl_risk", "low")))
+                                updated += 1
+                        except Exception:
+                            failed.append(row[4])
+
+                    conn.commit()
+                    st.success(f"✅ Weather updated for {updated} venue-date combinations")
+                    if failed:
+                        st.warning(f"Failed: {', '.join(failed)}")
+                except Exception as e:
+                    st.warning(f"Weather fetch not available: {e}\n\nOpen-Meteo fetch requires network access to api.open-meteo.com")
+
+    # ── 4. Clear old data ──────────────────────────────────────
+    with st.expander("🗑 Clear old data", expanded=False):
+        st.markdown("Remove stale records from the database.")
+        st.warning("⚠️ This cannot be undone. Make sure you have a backup.")
+
+        col1, col2 = st.columns(2)
+        with col1:
+            clear_year = st.selectbox("Delete data before year",
+                                      [2024, 2025], index=0, key="clear_year")
+        with col2:
+            confirm = st.checkbox(f"I confirm: delete all data before {clear_year}", key="clear_confirm")
+
+        if confirm and st.button("🗑 Clear old data", key="btn_clear", type="secondary"):
+            cutoff = f"{clear_year}-01-01"
+            deleted_hist = conn.execute("DELETE FROM elo_history WHERE match_date < ?", (cutoff,)).rowcount
+            deleted_log  = conn.execute("DELETE FROM elo_match_log WHERE match_date < ?", (cutoff,)).rowcount
+            conn.commit()
+            st.success(f"✅ Deleted {deleted_hist} history records and {deleted_log} match log entries before {clear_year}")
+
+    st.divider()
+
+    # ── FULL SUNDAY REFRESH ────────────────────────────────────
+    st.subheader("🗓 Full Sunday refresh")
+    st.markdown("""
+    Runs all updates in one go. Recommended weekly cadence:
+
+    | Step | What it does | Time |
+    |---|---|---|
+    | 1 | Rebuild ELO from 2024+ history | ~10 sec |
+    | 2 | Rebuild win probability table (demo) | ~90 sec |
+    | 3 | Refresh weather for next 7 days | ~15 sec |
+
+    **Total: ~2 minutes.** Press the button and come back.
+    """)
+
+    col1, col2 = st.columns([1, 2])
+    with col1:
+        sunday_mode = st.radio("WP table mode",
+                               ["Demo", "Cricsheet (if available)"],
+                               key="sun_mode", horizontal=False)
+        cricsheet_path = ""
+        if "Cricsheet" in sunday_mode:
+            cricsheet_path = st.text_input("Cricsheet path", key="sun_cs_path",
+                                           placeholder="/path/to/csvs")
+
+    with col2:
+        st.markdown("<br>", unsafe_allow_html=True)
+        run_sunday = st.button("🔄 Run full Sunday refresh",
+                               type="primary", key="btn_sunday")
+
+    if run_sunday:
+        progress = st.progress(0, text="Starting refresh...")
+        log = []
+
+        # Step 1: ELO
+        progress.progress(5, text="Step 1/3 — Rebuilding ELO ratings...")
+        try:
+            conn.execute("UPDATE elo_ratings SET rating=1500.0, matches_played=0, wins=0, losses=0")
+            conn.execute("DELETE FROM elo_history WHERE match_date < '2024-01-01'")
+            conn.execute("DELETE FROM elo_match_log WHERE match_date < '2024-01-01'")
+
+            ratings = {}
+            for h in conn.execute("""
+                SELECT team_id, gender, format, result, rating_after
+                FROM elo_history WHERE match_date >= '2024-01-01'
+                ORDER BY match_date
+            """).fetchall():
+                ratings[(h[0], h[1], h[2])] = h[4]
+
+            for (team, gender, fmt), rating in ratings.items():
+                wl = conn.execute("""
+                    SELECT SUM(CASE WHEN result='win' THEN 1 ELSE 0 END),
+                           SUM(CASE WHEN result='loss' THEN 1 ELSE 0 END),
+                           COUNT(*)
+                    FROM elo_history
+                    WHERE team_id=? AND gender=? AND format=? AND match_date >= '2024-01-01'
+                """, (team, gender, fmt)).fetchone()
+                conn.execute("""
+                    INSERT OR REPLACE INTO elo_ratings
+                    (team_id, team_type, gender, format, rating,
+                     matches_played, wins, losses, peak_rating, last_updated)
+                    VALUES (?,
+                        CASE WHEN ? IN ('India','England','Australia','Pakistan',
+                        'West Indies','New Zealand','South Africa','Sri Lanka',
+                        'Bangladesh','Afghanistan','Zimbabwe','Ireland')
+                        THEN 'international' ELSE 'franchise' END,
+                        ?,?,?,?,?,?,?,datetime('now'))
+                """, (team, team, gender, fmt, round(rating,2),
+                      wl[2] or 0, wl[0] or 0, wl[1] or 0, round(rating,2)))
+
+            conn.commit()
+            log.append(f"✅ ELO: {len(ratings)} ratings rebuilt from 2024+ data")
+        except Exception as e:
+            log.append(f"❌ ELO failed: {e}")
+
+        progress.progress(35, text="Step 2/3 — Rebuilding win probability table...")
+
+        # Step 2: WP table
+        try:
+            sys.path.insert(0, os.path.join(ROOT, "inplay_engine"))
+            from build_wp_table import get_conn as ip_get_conn, build_demo, process_cricsheet
+
+            ip_conn = ip_get_conn()
+            use_cricsheet = ("Cricsheet" in sunday_mode
+                             and cricsheet_path
+                             and os.path.exists(cricsheet_path))
+            if use_cricsheet:
+                process_cricsheet(cricsheet_path, ip_conn)
+                log.append(f"✅ WP table: rebuilt from real Cricsheet data at {cricsheet_path}")
+            else:
+                build_demo(ip_conn)
+                n_cells = ip_conn.execute("SELECT COUNT(*) FROM wp_lookup").fetchone()[0]
+                log.append(f"✅ WP table: {n_cells:,} cells rebuilt (demo mode)")
+            ip_conn.close()
+        except Exception as e:
+            log.append(f"❌ WP table failed: {e}")
+
+        progress.progress(75, text="Step 3/3 — Refreshing weather...")
+
+        # Step 3: Weather (best effort)
+        try:
+            import requests as req_lib
+            today_str = dt.date.today().isoformat()
+            week_str  = (dt.date.today() + dt.timedelta(days=7)).isoformat()
+            venues = conn.execute("""
+                SELECT DISTINCT m.venue_id, m.date, v.latitude, v.longitude
+                FROM matches m JOIN venues v ON v.venue_id = m.venue_id
+                WHERE m.date BETWEEN ? AND ? AND v.latitude IS NOT NULL
+            """, (today_str, week_str)).fetchall()
+
+            wx_updated = 0
+            for venue_id, mdate, lat, lon in venues:
+                try:
+                    r = req_lib.get(
+                        f"https://api.open-meteo.com/v1/forecast"
+                        f"?latitude={lat}&longitude={lon}"
+                        f"&daily=precipitation_probability_max,temperature_2m_max"
+                        f"&timezone=auto&start_date={mdate}&end_date={mdate}",
+                        timeout=5
+                    )
+                    if r.status_code == 200:
+                        data = r.json()
+                        rain = data["daily"]["precipitation_probability_max"][0]
+                        temp = data["daily"]["temperature_2m_max"][0]
+                        cond = "rain" if rain > 60 else "cloudy" if rain > 30 else "clear"
+                        dl   = "high" if rain > 60 else "medium" if rain > 30 else "low"
+                        conn.execute("""
+                            INSERT OR REPLACE INTO weather
+                            (venue_id, match_date, fetched_at,
+                             rain_prob_pct, temp_celsius, condition, dl_risk)
+                            VALUES (?,?,datetime('now'),?,?,?,?)
+                        """, (venue_id, mdate, rain, temp, cond, dl))
+                        wx_updated += 1
+                except Exception:
+                    pass
+            conn.commit()
+            log.append(f"✅ Weather: {wx_updated} venue-dates updated")
+        except Exception as e:
+            log.append(f"⚠️ Weather: skipped ({e})")
+
+        progress.progress(100, text="Done ✅")
+
+        # Results
+        st.divider()
+        st.subheader("Refresh complete")
+        for line in log:
+            if line.startswith("✅"):
+                st.success(line)
+            elif line.startswith("⚠️"):
+                st.warning(line)
+            else:
+                st.error(line)
+
+        # Updated stats
+        col1, col2, col3 = st.columns(3)
+        col1.metric("ELO ratings active",
+                    conn.execute("SELECT COUNT(*) FROM elo_ratings WHERE matches_played>0").fetchone()[0])
+        col2.metric("H2H records",
+                    conn.execute("SELECT COUNT(*) FROM h2h_full").fetchone()[0])
+        try:
+            ip_c = sqlite3.connect(os.path.join(ROOT, "db", "inplay_engine.db"))
+            col3.metric("WP table cells", f"{ip_c.execute('SELECT COUNT(*) FROM wp_lookup').fetchone()[0]:,}")
+            ip_c.close()
+        except Exception:
+            col3.metric("WP table cells", "—")
+
+        st.caption(f"Last refresh: {dt.datetime.now().strftime('%A %d %b %Y %H:%M')}")
+
+    st.divider()
+
+    # ── Config settings ────────────────────────────────────────
+    st.subheader("⚙️ Engine configuration")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("**In-play thresholds**")
+        add_thresh = st.slider("ADD edge threshold (%)", 3, 15, 6, 1,
+                               help="Minimum edge required to ADD in-play")
+        hedge_odds = st.slider("HEDGE odds trigger", 1.10, 1.50, 1.28, 0.01,
+                               format="%.2f",
+                               help="Lay to lock profit when odds drop below this")
+        exit_thresh = st.slider("EXIT edge threshold (%)", -20, -5, -10, 1,
+                                help="Exit position when model is this far wrong")
+    with col2:
+        st.markdown("**Daily brief**")
+        week_days = st.slider("Brief horizon (days ahead)", 3, 14, 7, 1,
+                              help="How many days ahead to show in daily brief")
+        min_conf = st.slider("Min confidence to show BET", 60, 80, 72, 1,
+                             help="Confidence score threshold for BET verdict")
+        st.markdown("**ELO engine**")
+        elo_blend = st.slider("ELO blend in in-play (%)", 10, 50, 30, 5,
+                              help="How much ELO vs historical table in WP calculation")
+
+    if st.button("💾 Save configuration", key="btn_save_config"):
+        # Store in session state for this session
+        st.session_state["add_thresh"]  = add_thresh / 100
+        st.session_state["hedge_odds"]  = hedge_odds
+        st.session_state["exit_thresh"] = exit_thresh / 100
+        st.session_state["week_days"]   = week_days
+        st.session_state["min_conf"]    = min_conf
+        st.session_state["elo_blend"]   = elo_blend / 100
+        st.success("✅ Configuration saved for this session")
+        st.caption("Note: config resets on app restart. Persistent config storage coming in a future update.")
