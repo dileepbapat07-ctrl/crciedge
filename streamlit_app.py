@@ -180,7 +180,9 @@ if page == "📅 Daily brief":
                vs.avg_first_innings, vs.bat_first_win_pct
         FROM matches m
         LEFT JOIN weather w ON w.venue_id = m.venue_id AND w.match_date = m.date
-        LEFT JOIN venue_stats vs ON vs.venue_id = m.venue_id AND vs.format = m.format
+        LEFT JOIN venue_stats vs ON vs.venue_id = m.venue_id
+            AND vs.format = m.format
+            AND vs.gender = m.gender
         WHERE m.date BETWEEN ? AND ?
         ORDER BY m.date, m.step
     """, (today, week_end)).fetchall()
@@ -829,9 +831,9 @@ elif page == "🔴 Match dashboard":
 
     # ── Gender filter + Match picker ───────────────────────────
     # Check if this day has both men's and women's matches
-    has_men   = any("female" not in m.get("gender","") and "Women" not in m["team_a"]
+    has_men   = any("female" not in dict(m).get("gender","") and "Women" not in m["team_a"]
                     for m in day_matches)
-    has_women = any("female" in m.get("gender","") or "Women" in m["team_a"]
+    has_women = any("female" in dict(m).get("gender","") or "Women" in m["team_a"]
                     for m in day_matches)
 
     with col2:
@@ -846,7 +848,7 @@ elif page == "🔴 Match dashboard":
             is_female = gender_filter == "👩 Women's"
             filtered_day = [
                 m for m in day_matches
-                if ("female" in m.get("gender","") or "Women" in m["team_a"]) == is_female
+                if ("female" in dict(m).get("gender","") or "Women" in m["team_a"]) == is_female
             ]
         else:
             # Only one gender today — no filter needed
@@ -883,7 +885,7 @@ elif page == "🔴 Match dashboard":
     ta    = match["team_a"]
     tb    = match["team_b"]
     fmt   = match["format"]
-    gender= "female" if any(w in match.get("gender","").lower()
+    gender= "female" if any(w in (match.get("gender","") or "").lower()
                             for w in ["female","women"]) else "male"
 
     # ── Match info strip ───────────────────────────────────────
@@ -1320,8 +1322,8 @@ elif page == "👁 In-play engine":
             opts = {}
             for day_lbl, day_matches in date_groups.items():
                 for m in day_matches:
-                    gender_icon = "👩" if m.get("gender","male") == "female" \
-                                      or "Women" in m["team_a"] else "👨"
+                    g = dict(m).get("gender","male")
+                    gender_icon = "👩" if g == "female" or "Women" in m["team_a"] else "👨"
                     key = (f"{day_lbl} · {gender_icon} "
                            f"{m['team_a']} vs {m['team_b']} · "
                            f"{m['label']} [{m['format']}]")
@@ -1477,7 +1479,7 @@ elif page == "👁 In-play engine":
             format="%.2f", key="ip_podds",
             disabled=(pre_team=="— No pre-match bet —"))
 
-    gender_ip = "female" if any(w in sm_ip.get("gender","male").lower()
+    gender_ip = "female" if any(w in (sm_ip.get("gender","male") or "male").lower()
                                 for w in ["female","women","w"]) else "male"
 
     st.divider()
