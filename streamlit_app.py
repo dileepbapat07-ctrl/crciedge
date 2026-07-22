@@ -767,254 +767,347 @@ elif page == "📊 Over/Under totals":
 elif page == "👁 In-play engine":
     st.title("👁 In-play engine")
     st.markdown(
-        "Enter the live match state to get an **ADD / HOLD / HEDGE / EXIT** verdict. "
-        "Blends historical win frequencies (Approach B — Cricsheet 2024+) with ELO team ratings."
+        "Live match state → **ADD / HOLD / HEDGE / EXIT** verdict. "
+        "Blends Cricsheet 2024+ historical frequencies with ELO team ratings."
     )
     st.divider()
 
     sys.path.insert(0, os.path.join(ROOT, "inplay_engine"))
-
     try:
         from wp_lookup import MatchState, lookup
-        from verdict import decide, print_decision
+        from verdict import decide
         ENGINE_LOADED = True
     except Exception as e:
         st.error(f"In-play engine not loaded: {e}")
         ENGINE_LOADED = False
 
-    if ENGINE_LOADED:
+    if not ENGINE_LOADED:
+        st.stop()
 
-        conn = get_db()
+    import datetime as dt
+    import requests as _req
 
-        # ── Match selector ─────────────────────────────────────
-        st.subheader("1. Select the match in progress")
-        matches_ip = conn.execute("""
-            SELECT match_id, date, step, label, team_a, team_b,
-                   format, venue_id, gender, category
-            FROM matches ORDER BY date DESC, step DESC
-        """).fetchall()
+    conn  = get_db()
+    today = dt.date.today().isoformat()
+    yest  = (dt.date.today() - dt.timedelta(days=1)).isoformat()
+    nxt7  = (dt.date.today() + dt.timedelta(days=7)).isoformat()
 
-        ip_opts = {
-            f"Step {m['step']} | {m['date']} | {m['team_a']} vs {m['team_b']} [{m['format']}]":
-            dict(m) for m in matches_ip
-        }
-        sel_ip = st.selectbox("Match", list(ip_opts.keys()), key="ip_match")
-        sm_ip  = ip_opts[sel_ip]
+    # ── STEP 1: Match selector — yesterday to next 7 days ──────
+    st.subheader("Step 1 — Select match")
 
-        st.divider()
-        st.subheader("2. Enter live match state")
-        st.caption("Update these values from the live scoreboard or Cricbuzz app")
+    window_matches = conn.execute("""
+        SELECT match_id, date, step, label, team_a, team_b,
+               format, venue_id, gender, category, city
+        FROM matches
+        WHERE date BETWEEN ? AND ?
+        ORDER BY date, step
+    """, (yest, nxt7)).fetchall()
 
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            innings = st.radio("Innings", [1, 2], horizontal=True,
-                               format_func=lambda x: f"{'1st' if x==1 else '2nd'} innings",
-                               key="ip_inn")
-            batting_team = st.selectbox("Batting team",
-                [sm_ip["team_a"], sm_ip["team_b"]], key="ip_bat")
-            bowling_team = sm_ip["team_b"] if batting_team == sm_ip["team_a"] else sm_ip["team_a"]
-            st.caption(f"Bowling: **{bowling_team}**")
+    mode = st.radio("",
+        ["📅 This week (yesterday + 7 days)", "✏️ Enter teams manually"],
+        horizontal=True, key="ip_mode", label_visibility="collapsed"
+    )
 
-        with col2:
-            fmt_map = {"T20I":"T20I","T20":"T20","ODI":"ODI","100b":"100b","Test":"Test"}
-            fmt_ip  = fmt_map.get(sm_ip["format"], "T20")
-            total_balls = {"T20":120,"T20I":120,"100b":100,"ODI":300}.get(fmt_ip, 120)
+    sm_ip = None
 
-            score = st.number_input("Current score (runs)", 0, 500, 51, 1, key="ip_score")
-            wickets = st.number_input("Wickets lost", 0, 9, 3, 1, key="ip_wkts")
-            balls_done = st.number_input(
-                f"Balls completed (of {total_balls})",
-                0, total_balls, 44, 1, key="ip_balls"
+    if mode == "📅 This week (yesterday + 7 days)":
+        if window_matches:
+            # Group by date for display
+            from itertools import groupby
+            date_groups = {}
+            for m in window_matches:
+                d = m["date"]
+                lbl = "Yesterday" if d == yest else                       "Today"     if d == today else                       dt.date.fromisoformat(d).strftime("%a %d %b")
+                date_groups.setdefault(lbl, []).append(m)
+
+            opts = {}
+            for day_lbl, day_matches in date_groups.items():
+                for m in day_matches:
+                    key = f"{day_lbl} · {m['team_a']} vs {m['team_b']} · {m['label']} [{m['format']}]"
+                    opts[key] = dict(m)
+
+            sel = st.selectbox(
+                f"{len(window_matches)} matches — yesterday through next 7 days",
+                list(opts.keys()), key="ip_sel"
             )
+            sm_ip = opts[sel]
 
-        with col3:
-            target = None
-            if innings == 2:
-                target = st.number_input("Target (runs to win)", 50, 600, 144, 1, key="ip_target")
-            betfair_odds = st.number_input(
-                f"Betfair odds on {batting_team}",
-                1.01, 50.0, 2.95, 0.01, format="%.2f", key="ip_odds"
-            )
-
-        st.divider()
-        st.subheader("3. Your pre-match position")
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            pre_stake = st.number_input("Pre-match stake (€)", 0.0, 10000.0,
-                                        199.0, 1.0, key="ip_pstake")
-        with col2:
-            pre_odds  = st.number_input("Pre-match odds taken", 1.01, 20.0,
-                                        1.95, 0.01, format="%.2f", key="ip_podds")
-        with col3:
-            pre_team  = st.selectbox("Bet was on",
-                [sm_ip["team_a"], sm_ip["team_b"], "— No pre-match bet —"],
-                key="ip_pteam")
-
-        gender_ip = "male" if sm_ip.get("gender","male") in ("male","Men's") else "female"
-
-        if st.button("▶ Get in-play verdict", type="primary", key="ip_run"):
-            state = MatchState(
-                format          = fmt_ip,
-                innings         = innings,
-                batting_team    = batting_team,
-                bowling_team    = bowling_team,
-                balls_completed = balls_done,
-                score           = score,
-                wickets_lost    = wickets,
-                target          = target,
-                betfair_odds    = betfair_odds,
-                pre_match_stake = pre_stake if pre_team != "— No pre-match bet —" else 0,
-                pre_match_odds  = pre_odds,
-                pre_match_team  = pre_team if pre_team != "— No pre-match bet —" else batting_team,
-                bankroll        = bankroll,
-                phase           = ph,
-                gender          = gender_ip,
-            )
-
-            wp = lookup(state)
-            d  = decide(state)
-
-            # ── WP breakdown ───────────────────────────────────
-            st.divider()
-            st.subheader("Win probability breakdown")
-
-            balls_rem = total_balls - balls_done
-            c1,c2,c3,c4,c5 = st.columns(5)
-            c1.metric("Balls remaining", balls_rem)
-            c2.metric("Wickets in hand", 10 - wickets)
-            if target:
-                rr = round((target - score) / (balls_rem / 6), 2) if balls_rem > 0 else 0
-                c3.metric("Runs needed", target - score)
-                c4.metric("Required RR", f"{rr:.1f}")
-                c5.metric("Pressure", f"{wp.pressure_index:.1f}×",
-                          "High" if wp.pressure_index > 1.4 else
-                          "Medium" if wp.pressure_index > 1.1 else "Low")
-
-            st.divider()
-            import pandas as pd
-            wp_df = pd.DataFrame([
-                {"Source": "Historical (Cricsheet 2024+)",
-                 "Win %": f"{wp.historical_wp:.1%}",
-                 "Sample": wp.sample_size,
-                 "Confidence": wp.confidence,
-                 "Method": "WASP fallback" if wp.fallback_used else "Lookup table"},
-                {"Source": f"ELO ({batting_team} {wp.elo_batting:.0f} vs {bowling_team} {wp.elo_bowling:.0f})",
-                 "Win %": f"{wp.elo_wp:.1%}",
-                 "Sample": "—",
-                 "Confidence": "high",
-                 "Method": "ELO formula"},
-                {"Source": "BLENDED (70% hist + 30% ELO)",
-                 "Win %": f"{wp.blended_wp:.1%}",
-                 "Sample": "—",
-                 "Confidence": "—",
-                 "Method": "Combined"},
-                {"Source": f"Betfair implied (@ {betfair_odds})",
-                 "Win %": f"{wp.implied_wp:.1%}",
-                 "Sample": "—",
-                 "Confidence": "—",
-                 "Method": "Market"},
-            ])
-            st.dataframe(wp_df, width="stretch", hide_index=True)
-
-            edge_col = "#1DB87A" if wp.edge > 0 else "#E84040"
+            # Match info card
+            d_label = "Yesterday" if sm_ip["date"]==yest else                       "Today ↔ LIVE" if sm_ip["date"]==today else                       dt.date.fromisoformat(sm_ip["date"]).strftime("%a %d %b")
             st.markdown(
-                f"<div style='padding:10px 14px;background:var(--card);border:1px solid var(--bdr);"
-                f"border-radius:8px;font-size:14px'>"
-                f"Edge: <strong style='color:{edge_col}'>{wp.edge:+.1%}</strong> "
-                f"({batting_team} model {wp.blended_wp:.1%} vs Betfair {wp.implied_wp:.1%})"
+                f"<div style='padding:10px 14px;background:var(--card);"
+                f"border:1px solid var(--bdr);border-radius:8px;font-size:13px'>"
+                f"<strong>{sm_ip['team_a']}</strong> vs <strong>{sm_ip['team_b']}</strong>"
+                f" · {sm_ip['label']} · {sm_ip['format']}"
+                f" · {sm_ip.get('city','')} · Step {sm_ip['step']}"
+                f" · <span style='color:#00C8A0'>{d_label}</span>"
                 f"</div>",
                 unsafe_allow_html=True
             )
+        else:
+            st.info("No matches in DB for yesterday through next 7 days.")
 
-            # ── Verdict ────────────────────────────────────────
-            st.divider()
-            st.subheader("Verdict")
+    else:  # Manual
+        c1,c2,c3 = st.columns(3)
+        with c1: ta  = st.text_input("Batting team", "India", key="ip_mta")
+        with c2: tb  = st.text_input("Bowling team", "England", key="ip_mtb")
+        with c3: mfmt = st.selectbox("Format", ["T20","T20I","ODI","100b"], key="ip_mfmt")
+        sm_ip = {"match_id":"manual","date":today,"step":0,"label":"Manual",
+                 "team_a":ta,"team_b":tb,"format":mfmt,
+                 "venue_id":"","gender":"male","category":"International","city":""}
 
-            if d.verdict == "ADD":
-                st.success(f"""
-### ✅ ADD — Place €{d.add_stake:.2f} on {batting_team} @ {d.add_odds}
+    st.divider()
 
-**EV: {d.add_ev_pct:+.1f}%** · Edge: {wp.edge:+.1%} · Sample: {wp.sample_size} matches
+    if not sm_ip:
+        st.stop()
 
-{d.reason}
+    fmt_ip      = {"T20I":"T20I","T20":"T20","ODI":"ODI","100b":"100b","Test":"Test"}.get(sm_ip["format"],"T20")
+    total_balls = {"T20":120,"T20I":120,"100b":100,"ODI":300}.get(fmt_ip,120)
 
-**Combined P&L:**
-- If {batting_team} wins: **+€{d.pnl_if_batting_wins:.2f}**
-- If {batting_team} loses: **-€{abs(d.pnl_if_batting_loses):.2f}**
-- Daily cap remaining after adding: **€{d.daily_cap_remaining - d.add_stake:.2f}**
-                """)
+    # ── STEP 2: Live state — with auto-fetch button ─────────────
+    st.subheader("Step 2 — Live match state")
 
-            elif d.verdict == "HEDGE":
-                st.info(f"""
-### 🔄 HEDGE — Green up on Betfair
+    # Auto-fetch section
+    fetch_col, status_col = st.columns([1, 3])
+    with fetch_col:
+        do_fetch = st.button("🔄 Fetch live score", key="ip_fetch", type="secondary")
+    with status_col:
+        fetch_status = st.empty()
 
-Lay **€{d.lay_stake:.2f}** on {batting_team} at odds {betfair_odds}
+    # Session state for fetched values
+    if "ip_fetched" not in st.session_state:
+        st.session_state.ip_fetched = {}
 
-**Guaranteed profit: €{d.guaranteed_profit:.2f}** — locked in regardless of result.
+    fetched = st.session_state.ip_fetched
 
-Use Betfair's "**Green All**" function to automatically calculate the lay stake.
+    if do_fetch:
+        ta_name = sm_ip["team_a"]; tb_name = sm_ip["team_b"]
+        match_date = sm_ip["date"]
+        with fetch_status:
+            with st.spinner(f"Searching for live score: {ta_name} vs {tb_name}..."):
+                try:
+                    # Search for live score via web
+                    query = f"{ta_name} vs {tb_name} live score {match_date} cricket"
+                    headers = {
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                      "Chrome/124.0.0.0 Safari/537.36"
+                    }
+                    r = _req.get(
+                        f"https://www.google.com/search?q={_req.utils.quote(query)}&num=5",
+                        headers=headers, timeout=8
+                    )
 
-{d.reason}
-                """)
+                    import re
+                    text = r.text
 
-            elif d.verdict == "EXIT":
-                st.error(f"""
-### 🛑 EXIT — Close position early
+                    # Extract score patterns from Google result
+                    # Pattern: "51/3 (44 overs)" or "143/10 (99 balls)"
+                    score_pat = re.findall(r"(\d{1,3})/(\d{1,2})\s*\(?(\d{1,3}(?:\.\d)?)\s*(?:overs?|balls?|ov)\)?", text)
+                    target_pat = re.findall(r"(?:target|chasing|need[s]?)\s*[:\s]*(\d{2,3})", text, re.IGNORECASE)
+                    innings_pat = re.findall(r"(\d)(?:st|nd|rd|th)\s+innings?", text, re.IGNORECASE)
 
-{d.reason}
+                    parsed = {}
 
-Current exposure: **€{pre_stake:.2f}** — take the loss now rather than ride to the end.
-                """)
+                    if score_pat:
+                        # Take most recent score (last match)
+                        latest = score_pat[-1]
+                        parsed["score"]   = int(latest[0])
+                        parsed["wickets"] = int(latest[1])
+                        # Convert overs to balls
+                        overs_str = latest[2]
+                        if "." in overs_str:
+                            ov_parts = overs_str.split(".")
+                            parsed["balls_done"] = int(ov_parts[0])*6 + int(ov_parts[1])
+                        else:
+                            parsed["balls_done"] = int(overs_str) * 6
 
-            else:  # HOLD
-                st.warning(f"""
-### ⏸ HOLD — No action required
+                    if target_pat:
+                        parsed["target"] = int(target_pat[0])
 
-{d.reason}
+                    if innings_pat:
+                        parsed["innings"] = int(innings_pat[-1])
 
-Your pre-match bet of **€{pre_stake:.2f} @ {pre_odds}** is still valid.
-Let the match play out.
+                    # Try to detect batting team from context
+                    ta_low = ta_name.lower(); tb_low = tb_name.lower()
+                    # Look for team name near the score
+                    if parsed.get("score"):
+                        context_window = text[max(0,text.find(str(parsed["score"]))-200):
+                                              text.find(str(parsed["score"]))+200].lower()
+                        if ta_low.split()[-1] in context_window:
+                            parsed["batting_team"] = ta_name
+                        elif tb_low.split()[-1] in context_window:
+                            parsed["batting_team"] = tb_name
 
-P&L if {batting_team} wins: **+€{d.pnl_if_batting_wins:.2f}**
-P&L if {batting_team} loses: **-€{abs(d.pnl_if_batting_loses):.2f}**
-                """)
+                    if parsed:
+                        st.session_state.ip_fetched = parsed
+                        fetched = parsed
+                        fields_found = [k for k in ["score","wickets","balls_done","target","innings"] if k in parsed]
+                        fetch_status.success(f"✅ Fetched — found: {', '.join(fields_found)}")
+                    else:
+                        fetch_status.warning("⚠ Could not parse live score from search results. Enter manually below.")
 
-            # ── Scenario analysis ──────────────────────────────
-            st.divider()
-            st.subheader("What-if scenarios")
-            st.caption("How the verdict changes at different odds levels")
+                except Exception as e:
+                    fetch_status.warning(f"⚠ Fetch failed ({e}). Enter manually below.")
 
-            odds_range = [1.10, 1.20, 1.30, 1.50, 1.75, 2.00, 2.20, 2.50, 3.00, 4.00]
-            scen_rows = []
-            for test_odds in odds_range:
-                s_test = MatchState(
-                    format=fmt_ip, innings=innings,
-                    batting_team=batting_team, bowling_team=bowling_team,
-                    balls_completed=balls_done, score=score,
-                    wickets_lost=wickets, target=target,
-                    betfair_odds=test_odds,
-                    pre_match_stake=pre_stake,
-                    pre_match_odds=pre_odds,
-                    pre_match_team=pre_team if pre_team != "— No pre-match bet —" else batting_team,
-                    bankroll=bankroll, phase=ph, gender=gender_ip,
-                )
-                dtest = decide(s_test)
-                implied = round(1/test_odds*100, 1)
-                edge_t  = round((wp.blended_wp - 1/test_odds)*100, 1)
-                scen_rows.append({
-                    "Betfair odds": test_odds,
-                    "Implied WP": f"{implied}%",
-                    "Our model WP": f"{wp.blended_wp:.1%}",
-                    "Edge": f"{edge_t:+.1f}%",
-                    "Verdict": dtest.verdict,
-                    "Action": (f"Add €{dtest.add_stake:.0f}" if dtest.verdict=="ADD"
-                               else f"Lay €{dtest.lay_stake:.0f}" if dtest.verdict=="HEDGE"
-                               else dtest.verdict),
-                })
-            scen_df = pd.DataFrame(scen_rows)
-            st.dataframe(scen_df, width="stretch", hide_index=True)
+    st.caption("Values pre-filled from fetch if available — adjust as needed")
 
-# ══════════════════════════════════════════════════════════════════════════
+    c1,c2,c3 = st.columns(3)
+    with c1:
+        innings = st.radio("Innings", [1,2], horizontal=True,
+                           index=(fetched.get("innings",1)-1),
+                           format_func=lambda x:"1st innings" if x==1 else "2nd innings",
+                           key="ip_inn")
+        batting_opts = [sm_ip["team_a"], sm_ip["team_b"]]
+        bat_idx = 0
+        if "batting_team" in fetched:
+            bat_idx = 0 if fetched["batting_team"]==sm_ip["team_a"] else 1
+        batting_team = st.selectbox("Who is batting", batting_opts, index=bat_idx, key="ip_bat")
+        bowling_team = sm_ip["team_b"] if batting_team==sm_ip["team_a"] else sm_ip["team_a"]
+        st.success(f"🎳 Bowling: **{bowling_team}**")
+
+    with c2:
+        score      = st.number_input("Runs scored",
+                                     0, 600, fetched.get("score", 51), 1, key="ip_score")
+        wickets    = st.number_input("Wickets lost",
+                                     0, 9, fetched.get("wickets", 3), 1, key="ip_wkts")
+        balls_done = st.number_input(f"Balls completed (of {total_balls})",
+                                     0, total_balls, fetched.get("balls_done", 44), 1, key="ip_balls")
+
+    with c3:
+        target = None
+        if innings == 2:
+            target = st.number_input("Target (runs to win)", 50, 700,
+                                     fetched.get("target", 144), 1, key="ip_target")
+            bl = total_balls - int(balls_done)
+            if bl > 0 and target > score:
+                rr = (target - score) / (bl / 6)
+                st.metric("Required RR", f"{rr:.2f}")
+        betfair_odds = st.number_input(
+            f"Betfair odds on {batting_team}",
+            1.01, 50.0, 2.95, 0.01, format="%.2f", key="ip_odds",
+            help="Live Betfair Exchange price for batting team to win"
+        )
+        st.caption(f"Implied: {1/betfair_odds:.1%}")
+
+    st.divider()
+
+    # ── STEP 3: Pre-match position ──────────────────────────────
+    st.subheader("Step 3 — Your pre-match position")
+    c1,c2,c3 = st.columns(3)
+    with c1:
+        pre_team = st.selectbox("Bet was on",
+            [sm_ip["team_a"], sm_ip["team_b"], "— No pre-match bet —"], key="ip_pteam")
+    with c2:
+        pre_stake = st.number_input("Stake placed (€)", 0.0, 50000.0,
+            199.0 if pre_team!="— No pre-match bet —" else 0.0, 1.0, key="ip_pstake",
+            disabled=(pre_team=="— No pre-match bet —"))
+    with c3:
+        pre_odds = st.number_input("Odds taken", 1.01, 20.0, 1.95, 0.01,
+            format="%.2f", key="ip_podds",
+            disabled=(pre_team=="— No pre-match bet —"))
+
+    gender_ip = "female" if any(w in sm_ip.get("gender","male").lower()
+                                for w in ["female","women","w"]) else "male"
+
+    st.divider()
+    if st.button("▶  Get verdict", type="primary", key="ip_run"):
+        state = MatchState(
+            format=fmt_ip, innings=innings,
+            batting_team=batting_team, bowling_team=bowling_team,
+            balls_completed=int(balls_done), score=int(score),
+            wickets_lost=int(wickets),
+            target=int(target) if target else None,
+            betfair_odds=float(betfair_odds),
+            pre_match_stake=float(pre_stake) if pre_team!="— No pre-match bet —" else 0.0,
+            pre_match_odds=float(pre_odds),
+            pre_match_team=pre_team if pre_team!="— No pre-match bet —" else batting_team,
+            bankroll=bankroll, phase=ph, gender=gender_ip,
+        )
+        wp = lookup(state)
+        d  = decide(state)
+
+        # WP breakdown
+        st.subheader("Win probability")
+        c1,c2,c3,c4,c5 = st.columns(5)
+        c1.metric("Balls left",   total_balls - int(balls_done))
+        c2.metric("Wickets left", 10 - int(wickets))
+        if target:
+            c3.metric("Runs needed", int(target)-int(score))
+            c4.metric("Req RR", f"{wp.required_rr or 0:.1f}")
+            p = wp.pressure_index or 1.0
+            c5.metric("Pressure", f"{p:.1f}×",
+                      "🔴 High" if p>1.4 else "🟡 Med" if p>1.1 else "🟢 Low",
+                      delta_color="inverse" if p>1.4 else "normal")
+
+        import pandas as pd
+        wpdf = pd.DataFrame([
+            {"Source":"Historical (Cricsheet 2024+)","Win %":f"{wp.historical_wp:.1%}",
+             "n":wp.sample_size,"Quality":wp.confidence,
+             "Note":"WASP fallback" if wp.fallback_used else "Lookup table ✓"},
+            {"Source":f"ELO ({batting_team} {wp.elo_batting:.0f} vs {bowling_team} {wp.elo_bowling:.0f})",
+             "Win %":f"{wp.elo_wp:.1%}","n":"—","Quality":"high","Note":"2024+ ELO ratings"},
+            {"Source":"Blended (70% hist + 30% ELO)","Win %":f"{wp.blended_wp:.1%}",
+             "n":"—","Quality":"—","Note":"← Model output"},
+            {"Source":f"Betfair @ {betfair_odds}","Win %":f"{wp.implied_wp:.1%}",
+             "n":"—","Quality":"—","Note":"Market implied"},
+        ])
+        st.dataframe(wpdf, width="stretch", hide_index=True)
+
+        ec = "#1DB87A" if wp.edge>0 else "#E84040"
+        st.markdown(
+            f"<div style='padding:10px 14px;background:var(--card);"
+            f"border:1px solid var(--bdr);border-radius:8px'>"
+            f"<strong>Edge:</strong> <span style='color:{ec};font-size:16px;font-weight:600'>"
+            f"{wp.edge:+.1%}</span>&nbsp;·&nbsp;"
+            f"Model {wp.blended_wp:.1%} vs Market {wp.implied_wp:.1%}"
+            f"</div>", unsafe_allow_html=True)
+
+        st.divider()
+        st.subheader("Verdict")
+        if d.verdict=="ADD":
+            st.success(f"""### ✅ ADD — Place **€{d.add_stake:.2f}** on {batting_team} @ {d.add_odds}
+**EV: {d.add_ev_pct:+.1f}%** · Edge {wp.edge:+.1%} · n={wp.sample_size}  
+{d.reason}  
+**If {batting_team} wins → +€{d.pnl_if_batting_wins:.2f}** · **loses → -€{abs(d.pnl_if_batting_loses):.2f}**""")
+        elif d.verdict=="HEDGE":
+            st.info(f"""### 🔄 HEDGE — Green up on Betfair
+Lay **€{d.lay_stake:.2f}** @ {betfair_odds} → **€{d.guaranteed_profit:.2f} guaranteed** regardless of result.  
+Use Betfair's **Green All** button. {d.reason}""")
+        elif d.verdict=="EXIT":
+            st.error(f"""### 🛑 EXIT — Cut position now
+{d.reason}  
+Exposure **€{pre_stake:.2f}** — limit the loss, don't ride to the end.""")
+        else:
+            st.warning(f"""### ⏸ HOLD — No action
+{d.reason}  
+**€{pre_stake:.2f} @ {pre_odds}** pre-match bet is still valid. Sit tight.  
+Wins → **+€{d.pnl_if_batting_wins:.2f}** · Loses → **-€{abs(d.pnl_if_batting_loses):.2f}**""")
+
+        # What-if table
+        st.divider()
+        st.subheader("What-if — verdict at different odds")
+        scen_rows=[]
+        for to in [1.10,1.20,1.30,1.50,1.75,2.00,2.20,2.50,3.00,4.00,6.00]:
+            st2=MatchState(format=fmt_ip,innings=innings,batting_team=batting_team,
+                           bowling_team=bowling_team,balls_completed=int(balls_done),
+                           score=int(score),wickets_lost=int(wickets),
+                           target=int(target) if target else None,betfair_odds=to,
+                           pre_match_stake=float(pre_stake) if pre_team!="— No pre-match bet —" else 0,
+                           pre_match_odds=float(pre_odds),
+                           pre_match_team=pre_team if pre_team!="— No pre-match bet —" else batting_team,
+                           bankroll=bankroll,phase=ph,gender=gender_ip)
+            d2=decide(st2)
+            scen_rows.append({"Odds":to,"Market implies":f"{1/to:.1%}",
+                              "Model WP":f"{wp.blended_wp:.1%}",
+                              "Edge":f"{(wp.blended_wp-1/to)*100:+.1f}%",
+                              "Verdict":d2.verdict,
+                              "Action":(f"Add €{d2.add_stake:.0f}" if d2.verdict=="ADD"
+                                        else f"Lay €{d2.lay_stake:.0f}" if d2.verdict=="HEDGE"
+                                        else d2.verdict)})
+        st.dataframe(pd.DataFrame(scen_rows), width="stretch", hide_index=True)
+
+
 # PAGE: PLAYER ANALYTICS
 # ══════════════════════════════════════════════════════════════════════════
 elif page == "👤 Player analytics":
