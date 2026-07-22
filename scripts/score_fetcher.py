@@ -385,46 +385,67 @@ def _try_cricbuzz(team_a: str, team_b: str) -> ScoreResult:
         return ScoreResult(error=f"Cricbuzz exception: {e}")
 
 # ── Strategy 4: Claude-powered search (via Anthropic API) ─────
-def _try_claude_search(team_a: str, team_b: str, match_date: str) -> ScoreResult:
+def _try_claude_search(team_a: str, team_b: str, match_date: str,
+                       api_key: str = "") -> ScoreResult:
     """
-    Use Claude's own web search capability to find the live score.
-    This calls the Anthropic API from within the Streamlit app.
-    Most reliable as Claude knows how to parse cricket scores.
+    Use Claude's web search to find the live score.
+    Requires ANTHROPIC_API_KEY in Streamlit secrets or environment.
+    Most reliable source as Claude can search and parse any format.
     """
     if not HAS_REQUESTS:
         return ScoreResult(error="requests not installed")
+
+    # Get API key from environment or passed parameter
+    key = api_key or os.environ.get("ANTHROPIC_API_KEY", "")
+    if not key:
+        # Try to get from streamlit secrets
+        try:
+            import streamlit as st
+            key = st.secrets.get("ANTHROPIC_API_KEY", "")
+        except Exception:
+            pass
+
+    if not key:
+        return ScoreResult(error="No ANTHROPIC_API_KEY found in environment or secrets")
+
     try:
         payload = {
             "model": "claude-sonnet-4-6",
-            "max_tokens": 300,
+            "max_tokens": 400,
             "tools": [{"type": "web_search_20250305", "name": "web_search"}],
             "messages": [{
                 "role": "user",
                 "content": (
-                    f"What is the current live score for {team_a} vs {team_b} "
-                    f"cricket match on {match_date}? "
-                    f"Reply ONLY in this exact format, nothing else:\n"
+                    f"Search for the live cricket score: {team_a} vs {team_b} "
+                    f"on {match_date}. "
+                    f"Reply ONLY in this exact structured format (no other text):\n"
                     f"SCORE: runs/wickets\n"
-                    f"OVERS: X.Y\n"
+                    f"BALLS: balls_completed\n"
                     f"INNINGS: 1 or 2\n"
-                    f"TARGET: runs (if 2nd innings, else omit)\n"
-                    f"BATTING: team name\n"
-                    f"STATUS: Live/Complete/Break\n"
-                    f"RESULT: result string if complete (else omit)"
+                    f"TARGET: runs_needed_to_win (only if 2nd innings, else omit)\n"
+                    f"BATTING: team_name_batting_now\n"
+                    f"STATUS: Live or Complete or NotStarted\n"
+                    f"RESULT: result_string (only if complete, else omit)\n\n"
+                    f"If match has not started yet, reply:\n"
+                    f"STATUS: NotStarted\n"
+                    f"TOSS: winner elected to bat/field (if known)"
                 )
             }]
         }
         r = requests.post(
             "https://api.anthropic.com/v1/messages",
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Content-Type":      "application/json",
+                "x-api-key":         key,
+                "anthropic-version": "2023-06-01",
+            },
             json=payload,
-            timeout=15
+            timeout=20
         )
         if r.status_code != 200:
-            return ScoreResult(error=f"Claude API HTTP {r.status_code}")
+            return ScoreResult(error=f"Claude API HTTP {r.status_code}: {r.text[:100]}")
 
         data = r.json()
-        # Extract text from response
         text_blocks = [b["text"] for b in data.get("content", [])
                        if b.get("type") == "text"]
         response_text = "\n".join(text_blocks)
@@ -433,40 +454,48 @@ def _try_claude_search(team_a: str, team_b: str, match_date: str) -> ScoreResult
         res = ScoreResult(source="Claude web search")
 
         score_m  = re.search(r"SCORE:\s*(\d+)/(\d+)", response_text)
-        overs_m  = re.search(r"OVERS:\s*([\d.]+)", response_text)
+        balls_m  = re.search(r"BALLS:\s*(\d+)", response_text)
         inn_m    = re.search(r"INNINGS:\s*(\d)", response_text)
         tgt_m    = re.search(r"TARGET:\s*(\d+)", response_text)
         bat_m    = re.search(r"BATTING:\s*(.+)", response_text)
-        status_m = re.search(r"STATUS:\s*(.+)", response_text)
+        status_m = re.search(r"STATUS:\s*(\w+)", response_text)
         result_m = re.search(r"RESULT:\s*(.+)", response_text)
+        toss_m   = re.search(r"TOSS:\s*(.+)", response_text)
 
         if score_m:
             res.score    = int(score_m.group(1))
             res.wickets  = int(score_m.group(2))
             res.success  = True
-        if overs_m:
-            res.overs_str  = overs_m.group(1)
-            res.balls_done = overs_to_balls(overs_m.group(1))
+        if balls_m:
+            res.balls_done = int(balls_m.group(1))
+            res.overs_str  = f"{res.balls_done//6}.{res.balls_done%6}"
         if inn_m:
             res.innings = int(inn_m.group(1))
         if tgt_m:
             res.target     = int(tgt_m.group(1))
-            res.runs_needed= res.target - res.score
+            res.runs_needed= res.target - res.score if res.score else None
         if bat_m:
             res.batting_team = bat_m.group(1).strip()
-            res.bowling_team = team_b if res.batting_team==team_a else team_a
+            res.bowling_team = (team_b if res.batting_team.lower() in team_a.lower()
+                               else team_a)
         if status_m:
             res.match_status = status_m.group(1).strip()
+            if res.match_status == "NotStarted":
+                res.success = False
+                res.error   = "Match has not started yet"
+                if toss_m:
+                    res.toss_winner = toss_m.group(1).strip()
         if result_m:
             res.result_str = result_m.group(1).strip()
+            res.match_status = "Complete"
 
-        if not res.success:
-            res.error = f"Claude returned: {response_text[:200]}"
+        if not res.success and not res.error:
+            res.error = f"Could not parse response: {response_text[:200]}"
 
         return res
 
     except Exception as e:
-        return ScoreResult(error=f"Claude search exception: {e}")
+        return ScoreResult(error=f"Claude search error: {e}")
 
 # ── Main entry point ──────────────────────────────────────────
 def fetch_live_score(
@@ -474,12 +503,13 @@ def fetch_live_score(
     team_b:     str,
     match_date: str,
     fmt:        str = "ODI",
-    text_input: str = "",   # if user pastes text — skip all API calls
+    text_input: str = "",
+    api_key:    str = "",
 ) -> ScoreResult:
     """
     Try 4 strategies in order, return first success.
     """
-    # Strategy 0: user pasted text — parse directly, fastest
+    # Strategy 0: user pasted text
     if text_input and len(text_input) > 10:
         res = parse_score_from_text(text_input, team_a, team_b)
         if res.success:
@@ -488,7 +518,7 @@ def fetch_live_score(
 
     errors = []
 
-    # Strategy 1: cricketdata.org API
+    # Strategy 1: cricketdata.org
     res = _try_cricketdata(team_a, team_b, fmt)
     if res.success:
         return res
@@ -506,15 +536,19 @@ def fetch_live_score(
         return res
     errors.append(f"Cricbuzz: {res.error}")
 
-    # Strategy 4: Claude web search (most reliable but slowest)
-    res = _try_claude_search(team_a, team_b, match_date)
+    # Strategy 4: Claude web search
+    res = _try_claude_search(team_a, team_b, match_date, api_key)
     if res.success:
+        return res
+    if res.match_status == "NotStarted":
+        # Not an error — match just hasn't started
+        res.error = f"Match has not started yet. Toss: {res.toss_winner or 'not announced'}"
         return res
     errors.append(f"Claude: {res.error}")
 
-    # All failed
     return ScoreResult(
         success=False,
-        error=f"All sources failed:\n" + "\n".join(errors),
+        error="All sources failed. Enter score manually.",
+        raw_text="\n".join(errors),
         source="none"
     )
