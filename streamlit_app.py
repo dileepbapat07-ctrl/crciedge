@@ -144,6 +144,7 @@ with st.sidebar:
         "📅 Daily brief",
         "🎯 Decision engine",
         "📊 Over/Under totals",
+        "🔴 Match dashboard",
         "👁 In-play engine",
         "👤 Player analytics",
         "📈 Bankroll tracker",
@@ -598,11 +599,22 @@ elif page == "📊 Over/Under totals":
             SELECT avg_first_innings, avg_second_innings, matches_played,
                    highest_score, lowest_score
             FROM venue_stats
-            WHERE venue_id=? AND format IN (?,?)
-            ORDER BY matches_played DESC LIMIT 1
+            WHERE venue_id=? AND format IN (?,?,?)
+            AND avg_first_innings IS NOT NULL
+            ORDER BY
+                CASE format
+                    WHEN ? THEN 1
+                    WHEN 'T20' THEN 2
+                    WHEN 'T20I' THEN 3
+                    ELSE 4
+                END,
+                matches_played DESC
+            LIMIT 1
         """, (sm["venue_id"],
               sm["format"],
-              "T20" if sm["format"] in ("T20I","T20") else sm["format"])).fetchone()
+              "T20" if sm["format"] in ("T20I","T20","100b") else sm["format"],
+              "100b" if sm["format"] == "100b" else sm["format"],
+              sm["format"])).fetchone()
 
         # Show venue baseline
         if vs_row and vs_row["avg_first_innings"]:
@@ -762,6 +774,491 @@ elif page == "📊 Over/Under totals":
                 """)
 
 # ══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
+# PAGE: MATCH DASHBOARD
+# ══════════════════════════════════════════════════════════════════════════
+elif page == "🔴 Match dashboard":
+    import datetime as dt
+    import requests as _req
+    import re as _re
+
+    st.title("🔴 Match dashboard")
+    st.markdown(
+        "Track one match at a time from toss to result. "
+        "Each match has its own independent tracker."
+    )
+    st.divider()
+
+    conn  = get_db()
+    today = dt.date.today().isoformat()
+    yest  = (dt.date.today() - dt.timedelta(days=1)).isoformat()
+    nxt7  = (dt.date.today() + dt.timedelta(days=7)).isoformat()
+
+    # ── Load matches ───────────────────────────────────────────
+    window = conn.execute("""
+        SELECT match_id, date, step, label, team_a, team_b,
+               format, venue_id, gender, category, city
+        FROM matches WHERE date BETWEEN ? AND ?
+        ORDER BY date, step
+    """, (yest, nxt7)).fetchall()
+
+    if not window:
+        st.info("No matches in window. Check match schedule.")
+        st.stop()
+
+    # ── Group by date ──────────────────────────────────────────
+    from itertools import groupby
+    date_groups = {}
+    for m in window:
+        d = m["date"]
+        tag = "🟡 Yesterday" if d==yest else               "🔴 Today"     if d==today else               dt.date.fromisoformat(d).strftime("%a %d %b")
+        date_groups.setdefault(tag, []).append(dict(m))
+
+    # ── Date picker first ──────────────────────────────────────
+    col1, col2 = st.columns([1, 2])
+    with col1:
+        date_sel = st.selectbox(
+            "Date",
+            list(date_groups.keys()),
+            key="dash_date",
+            help="Select the day first"
+        )
+
+    day_matches = date_groups[date_sel]
+
+    # ── Gender filter + Match picker ───────────────────────────
+    # Check if this day has both men's and women's matches
+    has_men   = any("female" not in m.get("gender","") and "Women" not in m["team_a"]
+                    for m in day_matches)
+    has_women = any("female" in m.get("gender","") or "Women" in m["team_a"]
+                    for m in day_matches)
+
+    with col2:
+        if has_men and has_women:
+            gender_filter = st.radio(
+                "Gender",
+                ["👨 Men's", "👩 Women's"],
+                horizontal=True,
+                key="dash_gender",
+                help="Men's and Women's matches on the same day track independently"
+            )
+            is_female = gender_filter == "👩 Women's"
+            filtered_day = [
+                m for m in day_matches
+                if ("female" in m.get("gender","") or "Women" in m["team_a"]) == is_female
+            ]
+        else:
+            # Only one gender today — no filter needed
+            filtered_day = day_matches
+            gender_icon  = "👩 Women's" if has_women else "👨 Men's"
+            st.markdown(
+                f"<div style='padding:6px 10px;background:var(--card);"
+                f"border:1px solid var(--bdr);border-radius:8px;"
+                f"font-size:13px;color:var(--text-secondary)'>"
+                f"{gender_icon} only</div>",
+                unsafe_allow_html=True
+            )
+
+    # ── Match picker (after gender filter) ────────────────────
+    match_opts = {}
+    for m in filtered_day:
+        key = f"{m['team_a']} vs {m['team_b']} · {m['label']} [{m['format']}]"
+        match_opts[key] = m
+
+    if not match_opts:
+        st.warning("No matches found for this selection.")
+        st.stop()
+
+    n_shown = len(match_opts)
+    match_sel = st.selectbox(
+        f"{n_shown} match{'es' if n_shown>1 else ''} — select to track",
+        list(match_opts.keys()),
+        key="dash_match",
+        help="Each match has its own independent tracker"
+    )
+
+    match = match_opts[match_sel]
+    mid   = match["match_id"]
+    ta    = match["team_a"]
+    tb    = match["team_b"]
+    fmt   = match["format"]
+    gender= "female" if any(w in match.get("gender","").lower()
+                            for w in ["female","women"]) else "male"
+
+    # ── Match info strip ───────────────────────────────────────
+    d_label = ("🟡 Yesterday" if match["date"]==yest else
+               "🔴 Today — LIVE" if match["date"]==today else
+               dt.date.fromisoformat(match["date"]).strftime("%A %d %b"))
+    gender_str = "Women's" if gender=="female" else "Men's"
+
+    st.markdown(
+        f"<div style='padding:10px 16px;background:var(--card);"
+        f"border:1px solid var(--bdr);border-radius:10px;"
+        f"display:flex;justify-content:space-between;align-items:center'>"
+        f"<div>"
+        f"<span style='font-size:15px;font-weight:600'>{ta} vs {tb}</span>"
+        f"<span style='font-size:12px;color:#5A7090;margin-left:10px'>"
+        f"{match['label']} · {match['format']} · {gender_str} · {match.get('city','')} · Step {match['step']}"
+        f"</span></div>"
+        f"<span style='color:#00C8A0;font-size:12px;font-weight:600'>{d_label}</span>"
+        f"</div>",
+        unsafe_allow_html=True
+    )
+
+    # ── Per-match session state (keyed by match_id) ────────────
+    sk = f"dash_{mid}"   # unique state key per match
+    if sk not in st.session_state:
+        st.session_state[sk] = {
+            "phase":  "pre_toss",
+            "toss":   {},
+            "xi":     {},
+            "signal": None,
+            "score":  {},
+        }
+    S = st.session_state[sk]   # shorthand
+
+    st.divider()
+
+    # ── Phase progress bar ─────────────────────────────────────
+    phases       = ["pre_toss","xi_confirmed","match_live","completed"]
+    phase_labels = ["⏳ Pre-toss","🪙 XI ready","🔴 Live","✅ Done"]
+    p_idx = phases.index(S["phase"]) if S["phase"] in phases else 0
+
+    pcols = st.columns(4)
+    for i,(pl,pp) in enumerate(zip(phase_labels,phases)):
+        with pcols[i]:
+            if i < p_idx:
+                st.success(pl)
+            elif i == p_idx:
+                st.warning(f"**{pl}**")
+            else:
+                st.markdown(
+                    f"<div style='padding:8px;background:var(--sur);"
+                    f"border:1px solid var(--bdr);border-radius:8px;"
+                    f"text-align:center;font-size:12px;color:#5A7090'>{pl}</div>",
+                    unsafe_allow_html=True)
+
+    st.divider()
+
+    # ══════════════════════════════════════════════════════════
+    # STEP 1 — TOSS & XI
+    # ══════════════════════════════════════════════════════════
+    with st.expander(
+        f"🪙 Step 1 — Toss & Playing XI  "
+        f"{'✅ Done' if p_idx>=1 else '← Start here'}",
+        expanded=(p_idx==0)
+    ):
+        c1,c2 = st.columns(2)
+        with c1:
+            toss_winner = st.selectbox("Toss won by",[ta,tb,"—"],key=f"{sk}_tw")
+            toss_choice = st.radio("Elected to",["bat","field"],
+                                   horizontal=True,key=f"{sk}_tc")
+        with c2:
+            xi_paste = st.text_area(
+                "Paste playing XI (both teams)",
+                placeholder=f"{ta}: Player1, Player2, ...\n{tb}: Player1, Player2, ...",
+                height=80, key=f"{sk}_xp"
+            )
+
+        fc1,fc2 = st.columns(2)
+        with fc1:
+            if st.button("🌐 Auto-fetch XI", key=f"{sk}_fxi"):
+                with st.spinner("Fetching from ESPNcricinfo..."):
+                    try:
+                        sys.path.insert(0, os.path.join(ROOT,"scripts"))
+                        from fetch_playingxi import fetch_and_store_xi
+                        res = fetch_and_store_xi(mid, match["date"], ta, tb)
+                        if res["success"]:
+                            S["xi"] = res.get("players",{})
+                            st.success(f"✅ {res['count']} players fetched")
+                            for team,players in res.get("players",{}).items():
+                                st.write(f"**{team}:** {', '.join(players)}")
+                        else:
+                            st.warning("Auto-fetch failed — paste XI above")
+                    except Exception as e:
+                        st.error(f"{e}")
+
+        with fc2:
+            if st.button("✅ Confirm & run player signal",
+                         type="primary", key=f"{sk}_conf"):
+                # Parse pasted XI
+                if xi_paste and len(xi_paste)>10:
+                    try:
+                        sys.path.insert(0, os.path.join(ROOT,"scripts"))
+                        from fetch_playingxi import fetch_and_store_xi
+                        res = fetch_and_store_xi(mid, match["date"], ta, tb, xi_text=xi_paste)
+                        if res["success"]:
+                            S["xi"] = res.get("players",{})
+                    except Exception:
+                        pass
+
+                S["toss"] = {"winner":toss_winner,"choice":toss_choice}
+
+                # Run player signal
+                with st.spinner("Computing player signal..."):
+                    try:
+                        sys.path.insert(0, os.path.join(ROOT,"player_engine"))
+                        from player_signal import get_player_signal
+                        sig = get_player_signal(mid, ta, tb, fmt, match["venue_id"], gender)
+                        S["signal"] = sig
+                        st.success(f"✅ Player signal computed — "
+                                   f"{ta} {sig.team_a_signal.overall:.1f}/10 vs "
+                                   f"{tb} {sig.team_b_signal.overall:.1f}/10")
+                    except Exception as e:
+                        S["signal"] = None
+                        st.warning(f"Player signal error: {e}")
+
+                S["phase"] = "xi_confirmed"
+                st.rerun()
+
+    # ══════════════════════════════════════════════════════════
+    # STEP 2 — PRE-MATCH ANALYSIS
+    # ══════════════════════════════════════════════════════════
+    with st.expander(
+        f"📊 Step 2 — Pre-match player analysis  "
+        f"{'✅ Done' if p_idx>=2 else ''}",
+        expanded=(p_idx==1)
+    ):
+        toss = S["toss"]
+        sig  = S["signal"]
+
+        if not toss:
+            st.info("Complete Step 1 first.")
+        else:
+            if toss.get("winner","—") != "—":
+                tw2 = toss["winner"]; tc2 = toss["choice"]
+                bat1st = tw2 if tc2=="bat" else (tb if tw2==ta else ta)
+                bowl1st= tb if bat1st==ta else ta
+                st.info(f"🪙 **{tw2}** won toss · elected to **{tc2}** · "
+                        f"**{bat1st}** bats first")
+
+            if sig:
+                import pandas as pd
+                ta_s = sig.team_a_signal
+                tb_s = sig.team_b_signal
+
+                c1,c2,c3,c4 = st.columns(4)
+                c1.metric(f"{ta}",    f"{ta_s.overall:.1f}/10")
+                c2.metric(f"{tb}",    f"{tb_s.overall:.1f}/10")
+                c3.metric("Signal",   f"{sig.signal_factor:.1f}/10",
+                          f"{ta} edge" if sig.signal_factor>5.5 else
+                          f"{tb} edge" if sig.signal_factor<4.5 else "Even")
+                c4.metric("EV adj",   f"{sig.signal_ev_adj:+.1f}%")
+
+                fdf = pd.DataFrame([
+                    {"Factor":"Batting",     ta:ta_s.batting_score,  tb:tb_s.batting_score},
+                    {"Factor":"Bowling",     ta:ta_s.bowling_score,  tb:tb_s.bowling_score},
+                    {"Factor":"Form",        ta:ta_s.form_score,     tb:tb_s.form_score},
+                    {"Factor":"Venue",       ta:ta_s.venue_score,    tb:tb_s.venue_score},
+                    {"Factor":"Matchups",    ta:ta_s.matchup_score,  tb:tb_s.matchup_score},
+                    {"Factor":"Availability",ta:ta_s.avail_score,    tb:tb_s.avail_score},
+                ])
+                st.dataframe(fdf, width="stretch", hide_index=True,
+                             column_config={
+                                 ta:st.column_config.ProgressColumn(ta,min_value=0,max_value=10,format="%.1f"),
+                                 tb:st.column_config.ProgressColumn(tb,min_value=0,max_value=10,format="%.1f"),
+                             })
+
+                if sig.key_insights:
+                    for ins in sig.key_insights[:6]:
+                        if any(w in ins for w in ["dominates","OUT","⚠"]):
+                            st.warning(f"⚠ {ins}")
+                        elif any(w in ins for w in ["exceptional","outstanding","✅"]):
+                            st.success(f"✅ {ins}")
+                        else:
+                            st.info(f"ℹ {ins}")
+            else:
+                st.info("Player signal not available — check player_engine.db")
+
+            if p_idx == 1:
+                if st.button("🔴 Match started",
+                             type="primary", key=f"{sk}_start"):
+                    S["phase"] = "match_live"
+                    S["score"] = {}
+                    st.rerun()
+
+    # ══════════════════════════════════════════════════════════
+    # STEP 3 — LIVE TRACKER
+    # ══════════════════════════════════════════════════════════
+    with st.expander(
+        f"🔴 Step 3 — Live in-play tracker",
+        expanded=(p_idx==2)
+    ):
+        if p_idx < 2:
+            st.info("Available once match starts (Step 2 → Match started).")
+        else:
+            sys.path.insert(0, os.path.join(ROOT,"inplay_engine"))
+            try:
+                from wp_lookup import MatchState, lookup
+                from verdict import decide
+                IP_OK = True
+            except Exception as e:
+                IP_OK = False
+                st.error(f"In-play engine: {e}")
+
+            if IP_OK:
+                total_balls = {"T20":120,"T20I":120,"100b":100,"ODI":300}.get(fmt,120)
+                fmt_ip = {"T20I":"T20I","T20":"T20","ODI":"ODI","100b":"100b"}.get(fmt,"T20")
+                score_d = S["score"]
+
+                # Refresh button
+                rc1,rc2 = st.columns([1,4])
+                with rc1:
+                    do_refresh = st.button("🔄 Refresh score",
+                                           type="primary", key=f"{sk}_ref")
+                with rc2:
+                    ref_status = st.empty()
+
+                if do_refresh:
+                    with ref_status, st.spinner("Fetching live score..."):
+                        try:
+                            sys.path.insert(0, os.path.join(ROOT, "scripts"))
+                            from score_fetcher import fetch_live_score
+                            res = fetch_live_score(ta, tb, match["date"], fmt)
+                            if res.success:
+                                fetched = dict(score_d)
+                                fetched["score"]      = res.score
+                                fetched["wickets"]    = res.wickets
+                                fetched["balls_done"] = res.balls_done
+                                if res.innings: fetched["innings"] = res.innings
+                                if res.target:  fetched["target"]  = res.target
+                                S["score"] = fetched
+                                score_d    = fetched
+                                ov = res.overs_str or f"{res.balls_done//6}.{res.balls_done%6}"
+                                ref_status.success(
+                                    f"✅ {res.score}/{res.wickets} ({ov} ov) "
+                                    f"via {res.source}"
+                                    + (f" · Target {res.target}" if res.target else "")
+                                )
+                                if res.result_str:
+                                    ref_status.info(f"🏆 {res.result_str}")
+                            else:
+                                ref_status.warning(
+                                    f"Could not fetch automatically. Enter manually below."
+                                )
+                        except Exception as e:
+                            ref_status.warning(f"Fetch error: {e}")
+                    innings = st.radio("Innings",[1,2],horizontal=True,
+                                       index=max(0,score_d.get("innings",1)-1),
+                                       format_func=lambda x:"1st" if x==1 else "2nd",
+                                       key=f"{sk}_inn")
+                    # Auto-set batting from toss
+                    bat_opts = [ta, tb]
+                    bat_idx  = 0
+                    if S["toss"] and innings==1:
+                        tw3 = S["toss"].get("winner","")
+                        tc3 = S["toss"].get("choice","")
+                        if tw3 and tc3:
+                            auto_bat = tw3 if tc3=="bat" else (tb if tw3==ta else ta)
+                            bat_idx  = 0 if auto_bat==ta else 1
+                    batting_team = st.selectbox("Batting",bat_opts,
+                                                index=bat_idx,key=f"{sk}_bat")
+                    bowling_team = tb if batting_team==ta else ta
+                    st.success(f"🎳 {bowling_team}")
+
+                with c2:
+                    score      = st.number_input("Runs",0,700,
+                                                 score_d.get("score",0),1,key=f"{sk}_sc")
+                    wickets    = st.number_input("Wickets",0,9,
+                                                 score_d.get("wickets",0),1,key=f"{sk}_wk")
+                    balls_done = st.number_input(f"Balls (of {total_balls})",
+                                                 0,total_balls,
+                                                 score_d.get("balls_done",0),1,key=f"{sk}_bd")
+
+                with c3:
+                    target = None
+                    if innings==2:
+                        target = st.number_input("Target",50,700,
+                                                 score_d.get("target",150),1,key=f"{sk}_tgt")
+                        bl = total_balls-int(balls_done)
+                        if bl>0 and target>score:
+                            st.metric("Req RR",f"{(target-score)/(bl/6):.2f}")
+                    bfo = st.number_input(f"Betfair odds ({batting_team})",
+                                          1.01,50.0,2.00,0.01,
+                                          format="%.2f",key=f"{sk}_bfo")
+                    st.caption(f"Implied: {1/bfo:.1%}")
+
+                # Pre-match position
+                st.markdown("**Your pre-match position**")
+                pc1,pc2,pc3 = st.columns(3)
+                with pc1:
+                    pre_team = st.selectbox("Bet on",[ta,tb,"— None —"],
+                                            key=f"{sk}_pt")
+                with pc2:
+                    pre_stake = st.number_input("Stake €",0.0,50000.0,0.0,1.0,
+                                                key=f"{sk}_ps",
+                                                disabled=pre_team=="— None —")
+                with pc3:
+                    pre_odds = st.number_input("Odds",1.01,20.0,2.00,0.01,
+                                               format="%.2f",key=f"{sk}_po",
+                                               disabled=pre_team=="— None —")
+
+                if st.button("▶ Get verdict", type="primary", key=f"{sk}_verd"):
+                    state = MatchState(
+                        format=fmt_ip, innings=innings,
+                        batting_team=batting_team, bowling_team=bowling_team,
+                        balls_completed=int(balls_done), score=int(score),
+                        wickets_lost=int(wickets),
+                        target=int(target) if target else None,
+                        betfair_odds=float(bfo),
+                        pre_match_stake=float(pre_stake) if pre_team!="— None —" else 0.0,
+                        pre_match_odds=float(pre_odds),
+                        pre_match_team=pre_team if pre_team!="— None —" else batting_team,
+                        bankroll=bankroll, phase=ph, gender=gender,
+                    )
+                    wp = lookup(state)
+                    d  = decide(state)
+
+                    # Show player signal influence
+                    if S["signal"]:
+                        sig3 = S["signal"]
+                        st.info(
+                            f"Player signal: **{sig3.signal_factor:.1f}/10** — "
+                            f"EV adj **{sig3.signal_ev_adj:+.1f}%** for {ta}"
+                        )
+
+                    if d.verdict=="ADD":
+                        msg = (f"### ✅ ADD — €{d.add_stake:.2f} on {batting_team} @ {d.add_odds}"
+                               + f"\n\nEV {d.add_ev_pct:+.1f}% · Edge {wp.edge:+.1%} · "
+                               + f"Model {wp.blended_wp:.1%} vs Market {wp.implied_wp:.1%}"
+                               + f"\n\n{d.reason}"
+                               + f"\n\nWins → **+€{d.pnl_if_batting_wins:.2f}** · "
+                               + f"Loses → **-€{abs(d.pnl_if_batting_loses):.2f}**")
+                        st.success(msg)
+                    elif d.verdict=="HEDGE":
+                        msg = (f"### 🔄 HEDGE — Lay €{d.lay_stake:.2f} → "
+                               + f"lock €{d.guaranteed_profit:.2f} guaranteed"
+                               + f"\n\n{d.reason}")
+                        st.info(msg)
+                    elif d.verdict=="EXIT":
+                        st.error(f"### 🛑 EXIT — Cut position\n\n{d.reason}")
+                    else:
+                        msg = (f"### ⏸ HOLD — No action"
+                               + f"\n\n{d.reason}"
+                               + f"\n\nWins → **+€{d.pnl_if_batting_wins:.2f}** · "
+                               + f"Loses → **-€{abs(d.pnl_if_batting_loses):.2f}**")
+                        st.warning(msg)
+
+                    with st.expander("Win probability detail"):
+                        import pandas as pd
+                        st.dataframe(pd.DataFrame([
+                            {"Source":"Historical","WP":f"{wp.historical_wp:.1%}",
+                             "n":wp.sample_size,"Note":wp.confidence},
+                            {"Source":f"ELO","WP":f"{wp.elo_wp:.1%}",
+                             "n":"—","Note":f"{batting_team} {wp.elo_batting:.0f} vs {bowling_team} {wp.elo_bowling:.0f}"},
+                            {"Source":"Blended","WP":f"{wp.blended_wp:.1%}","n":"—","Note":"Model"},
+                            {"Source":f"Market @ {bfo}","WP":f"{wp.implied_wp:.1%}","n":"—","Note":"Betfair"},
+                        ]), width="stretch", hide_index=True)
+
+                st.divider()
+                if st.button("✅ Match finished → Log result",
+                             key=f"{sk}_done"):
+                    S["phase"] = "completed"
+                    st.success("Go to **✏️ Log result** to record the outcome and update ELO.")
+                    st.rerun()
+
+
 # PAGE: IN-PLAY ENGINE
 # ══════════════════════════════════════════════════════════════════════════
 elif page == "👁 In-play engine":
@@ -823,7 +1320,11 @@ elif page == "👁 In-play engine":
             opts = {}
             for day_lbl, day_matches in date_groups.items():
                 for m in day_matches:
-                    key = f"{day_lbl} · {m['team_a']} vs {m['team_b']} · {m['label']} [{m['format']}]"
+                    gender_icon = "👩" if m.get("gender","male") == "female" \
+                                      or "Women" in m["team_a"] else "👨"
+                    key = (f"{day_lbl} · {gender_icon} "
+                           f"{m['team_a']} vs {m['team_b']} · "
+                           f"{m['label']} [{m['format']}]")
                     opts[key] = dict(m)
 
             sel = st.selectbox(
@@ -881,74 +1382,43 @@ elif page == "👁 In-play engine":
     fetched = st.session_state.ip_fetched
 
     if do_fetch:
-        ta_name = sm_ip["team_a"]; tb_name = sm_ip["team_b"]
-        match_date = sm_ip["date"]
         with fetch_status:
-            with st.spinner(f"Searching for live score: {ta_name} vs {tb_name}..."):
+            with st.spinner(f"Fetching score for {sm_ip['team_a']} vs {sm_ip['team_b']}..."):
                 try:
-                    # Search for live score via web
-                    query = f"{ta_name} vs {tb_name} live score {match_date} cricket"
-                    headers = {
-                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                                      "AppleWebKit/537.36 (KHTML, like Gecko) "
-                                      "Chrome/124.0.0.0 Safari/537.36"
-                    }
-                    r = _req.get(
-                        f"https://www.google.com/search?q={_req.utils.quote(query)}&num=5",
-                        headers=headers, timeout=8
+                    sys.path.insert(0, os.path.join(ROOT, "scripts"))
+                    from score_fetcher import fetch_live_score
+                    res = fetch_live_score(
+                        sm_ip["team_a"], sm_ip["team_b"],
+                        sm_ip["date"], fmt_ip
                     )
-
-                    import re
-                    text = r.text
-
-                    # Extract score patterns from Google result
-                    # Pattern: "51/3 (44 overs)" or "143/10 (99 balls)"
-                    score_pat = re.findall(r"(\d{1,3})/(\d{1,2})\s*\(?(\d{1,3}(?:\.\d)?)\s*(?:overs?|balls?|ov)\)?", text)
-                    target_pat = re.findall(r"(?:target|chasing|need[s]?)\s*[:\s]*(\d{2,3})", text, re.IGNORECASE)
-                    innings_pat = re.findall(r"(\d)(?:st|nd|rd|th)\s+innings?", text, re.IGNORECASE)
-
-                    parsed = {}
-
-                    if score_pat:
-                        # Take most recent score (last match)
-                        latest = score_pat[-1]
-                        parsed["score"]   = int(latest[0])
-                        parsed["wickets"] = int(latest[1])
-                        # Convert overs to balls
-                        overs_str = latest[2]
-                        if "." in overs_str:
-                            ov_parts = overs_str.split(".")
-                            parsed["balls_done"] = int(ov_parts[0])*6 + int(ov_parts[1])
-                        else:
-                            parsed["balls_done"] = int(overs_str) * 6
-
-                    if target_pat:
-                        parsed["target"] = int(target_pat[0])
-
-                    if innings_pat:
-                        parsed["innings"] = int(innings_pat[-1])
-
-                    # Try to detect batting team from context
-                    ta_low = ta_name.lower(); tb_low = tb_name.lower()
-                    # Look for team name near the score
-                    if parsed.get("score"):
-                        context_window = text[max(0,text.find(str(parsed["score"]))-200):
-                                              text.find(str(parsed["score"]))+200].lower()
-                        if ta_low.split()[-1] in context_window:
-                            parsed["batting_team"] = ta_name
-                        elif tb_low.split()[-1] in context_window:
-                            parsed["batting_team"] = tb_name
-
-                    if parsed:
-                        st.session_state.ip_fetched = parsed
-                        fetched = parsed
-                        fields_found = [k for k in ["score","wickets","balls_done","target","innings"] if k in parsed]
-                        fetch_status.success(f"✅ Fetched — found: {', '.join(fields_found)}")
+                    if res.success:
+                        fetched = {
+                            "score":      res.score,
+                            "wickets":    res.wickets,
+                            "balls_done": res.balls_done,
+                        }
+                        if res.innings: fetched["innings"] = res.innings
+                        if res.target:  fetched["target"]  = res.target
+                        if res.batting_team: fetched["batting_team"] = res.batting_team
+                        st.session_state.ip_fetched = fetched
+                        fetched_state = fetched
+                        ov = res.overs_str or f"{res.balls_done//6}.{res.balls_done%6}"
+                        fetch_status.success(
+                            f"✅ {res.score}/{res.wickets} ({ov} ov) "
+                            f"via **{res.source}**"
+                            + (f" · Target {res.target}" if res.target else "")
+                            + (f" · {res.match_status}" if res.match_status else "")
+                        )
+                        if res.result_str:
+                            fetch_status.info(f"🏆 {res.result_str}")
                     else:
-                        fetch_status.warning("⚠ Could not parse live score from search results. Enter manually below.")
-
+                        fetch_status.warning(
+                            f"Could not fetch automatically. "
+                            f"Paste the score text below instead.\n\n"
+                            f"Tried: cricketdata.org → ESPN → Cricbuzz → Claude search"
+                        )
                 except Exception as e:
-                    fetch_status.warning(f"⚠ Fetch failed ({e}). Enter manually below.")
+                    fetch_status.warning(f"Fetch error: {e}")
 
     st.caption("Values pre-filled from fetch if available — adjust as needed")
 
