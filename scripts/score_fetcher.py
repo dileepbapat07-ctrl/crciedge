@@ -363,28 +363,25 @@ def _try_espn(team_a: str, team_b: str, match_date: str) -> ScoreResult:
 def _try_cricbuzz(team_a: str, team_b: str) -> ScoreResult:
     """
     Cricbuzz live scores via their unofficial JSON API.
-    Tries multiple endpoints in order.
+    Handles 3 states: Live (has score), Upcoming (no score yet), Not found.
     """
     if not HAS_REQUESTS:
         return ScoreResult(error="requests not installed")
 
-    ta_key = team_a.lower().split()[-1]  # last word e.g. "brave", "fire", "india"
+    ta_key = team_a.lower().split()[-1]
     tb_key = team_b.lower().split()[-1]
 
     endpoints = [
-        # Cricbuzz live matches JSON
         "https://www.cricbuzz.com/api/cricket-match/live/matches",
-        # Cricbuzz scores feed
         "https://www.cricbuzz.com/cricket-match/live-scores",
-        # Cricbuzz match list API
         "https://www.cricbuzz.com/api/matches",
     ]
 
     cb_headers = {
         **HEADERS,
-        "Referer":  "https://www.cricbuzz.com/",
-        "Accept":   "application/json, text/html, */*",
-        "Origin":   "https://www.cricbuzz.com",
+        "Referer": "https://www.cricbuzz.com/",
+        "Accept":  "application/json, text/html, */*",
+        "Origin":  "https://www.cricbuzz.com",
     }
 
     for url in endpoints:
@@ -395,29 +392,61 @@ def _try_cricbuzz(team_a: str, team_b: str) -> ScoreResult:
 
             content = r.text
 
-            # Try JSON parse first
+            # Check if our match is mentioned at all
+            match_mentioned = (ta_key in content.lower() and
+                               tb_key in content.lower())
+
+            if not match_mentioned:
+                continue
+
+            # Try JSON parse
             try:
                 import json as _json
                 data = _json.loads(content)
-                # Walk the JSON looking for our match
+
                 def find_match(obj, depth=0):
                     if depth > 8:
                         return None
                     if isinstance(obj, dict):
-                        # Check if this is a match object with our teams
                         teams_str = str(obj).lower()
                         if ta_key in teams_str and tb_key in teams_str:
-                            # Extract score fields
-                            score = obj.get("score","") or obj.get("bat1Score","") or \
-                                    obj.get("batScore","") or obj.get("currentScore","")
-                            if score:
-                                res = parse_score_from_text(str(score), team_a, team_b)
+                            # Check match state
+                            state = (obj.get("state","") or
+                                     obj.get("status","") or
+                                     obj.get("matchState","") or "").lower()
+
+                            # Upcoming / not started
+                            if any(w in state for w in
+                                   ["upcoming","preview","not started","scheduled","yet to"]):
+                                res = ScoreResult(success=False)
+                                res.match_status = "NotStarted"
+                                res.error = "Match has not started yet"
+                                # Try to get start time
+                                start = (obj.get("startTime","") or
+                                         obj.get("matchTime","") or
+                                         obj.get("time",""))
+                                if start:
+                                    res.error = f"Match has not started yet — starts {start}"
+                                return res
+
+                            # Live — extract score
+                            score_raw = (obj.get("score","") or
+                                        obj.get("bat1Score","") or
+                                        obj.get("batScore","") or
+                                        obj.get("currentScore","") or
+                                        obj.get("liveScore",""))
+                            if score_raw:
+                                res = parse_score_from_text(
+                                    str(score_raw), team_a, team_b
+                                )
                                 if res.success:
                                     return res
+
                         for v in obj.values():
                             found = find_match(v, depth+1)
                             if found:
                                 return found
+
                     elif isinstance(obj, list):
                         for item in obj:
                             found = find_match(item, depth+1)
@@ -427,23 +456,35 @@ def _try_cricbuzz(team_a: str, team_b: str) -> ScoreResult:
 
                 result = find_match(data)
                 if result:
-                    result.source = "Cricbuzz"
+                    if result.success:
+                        result.source = "Cricbuzz"
                     return result
 
             except Exception:
                 pass
 
-            # Fallback: text parse
+            # Text parse fallback — check for "upcoming" keywords
+            content_low = content.lower()
+            if any(w in content_low for w in
+                   ["upcoming","not started","yet to begin","starts at","starts in"]):
+                res = ScoreResult(success=False)
+                res.match_status = "NotStarted"
+                res.error = "Match has not started yet"
+                return res
+
+            # Try text score parse
             parsed = parse_score_from_text(content, team_a, team_b)
             if parsed.success:
                 parsed.source = "Cricbuzz"
                 return parsed
 
-        except Exception:
+        except Exception as ex:
             continue
 
-    return ScoreResult(error="Cricbuzz: no score found in any endpoint",
-                       raw_text=f"Tried endpoints: {', '.join(endpoints)}")
+    return ScoreResult(
+        error="Cricbuzz: match not found in live feeds",
+        raw_text=f"Searched for '{ta_key}' and '{tb_key}' in {len(endpoints)} endpoints"
+    )
 
 # ── Strategy 4: Claude-powered search (via Anthropic API) ─────
 def _try_claude_search(team_a: str, team_b: str, match_date: str,
@@ -582,31 +623,25 @@ def fetch_live_score(
 
     errors = []
 
-    # Strategy 1: cricketdata.org
-    res = _try_cricketdata(team_a, team_b, fmt)
-    if res.success:
-        return res
-    errors.append(f"cricketdata: {res.error}")
-
-    # Strategy 2: ESPN
-    res = _try_espn(team_a, team_b, match_date)
-    if res.success:
-        return res
-    errors.append(f"ESPN: {res.error}")
-
-    # Strategy 3: Cricbuzz
-    res = _try_cricbuzz(team_a, team_b)
-    if res.success:
-        return res
-    errors.append(f"Cricbuzz: {res.error}")
+    # Each strategy: if match not started, return immediately — no point trying others
+    for name, fn_result in [
+        ("cricketdata", _try_cricketdata(team_a, team_b, fmt)),
+        ("ESPN",        _try_espn(team_a, team_b, match_date)),
+        ("Cricbuzz",    _try_cricbuzz(team_a, team_b)),
+    ]:
+        if fn_result.success:
+            return fn_result
+        if fn_result.match_status == "NotStarted":
+            fn_result.error = fn_result.error or "Match has not started yet"
+            return fn_result
+        errors.append(f"{name}: {fn_result.error}")
 
     # Strategy 4: Claude web search
     res = _try_claude_search(team_a, team_b, match_date, api_key)
     if res.success:
         return res
     if res.match_status == "NotStarted":
-        # Not an error — match just hasn't started
-        res.error = f"Match has not started yet. Toss: {res.toss_winner or 'not announced'}"
+        res.error = res.error or "Match has not started yet"
         return res
     errors.append(f"Claude: {res.error}")
 
