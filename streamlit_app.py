@@ -1117,8 +1117,10 @@ elif page == "🔴 Match dashboard":
                         try:
                             sys.path.insert(0, os.path.join(ROOT, "scripts"))
                             from score_fetcher import fetch_live_score
-                            api_key = st.secrets.get("ANTHROPIC_API_KEY","") if hasattr(st,"secrets") else ""
+                            api_key = st.secrets["ANTHROPIC_API_KEY"] if "ANTHROPIC_API_KEY" in st.secrets else os.environ.get("ANTHROPIC_API_KEY","")
+                            from score_fetcher import fetch_live_score
                             res = fetch_live_score(ta, tb, match["date"], fmt, api_key=api_key)
+                            st.session_state[f"fetch_log_{mid}"] = res
                             if res.success:
                                 fetched = dict(score_d)
                                 fetched["score"]      = res.score
@@ -1142,6 +1144,17 @@ elif page == "🔴 Match dashboard":
                                 )
                         except Exception as e:
                             ref_status.warning(f"Fetch error: {e}")
+                    # Show fetch log
+                    log_key = f"fetch_log_{mid}"
+                    if log_key in st.session_state:
+                        _r = st.session_state[log_key]
+                        with st.expander("🔍 Fetch log", expanded=not _r.success):
+                            st.text(f"Source tried:  {_r.source or 'none'}")
+                            st.text(f"Success:       {_r.success}")
+                            if _r.error:
+                                st.text(f"Error:         {_r.error}")
+                            if _r.raw_text:
+                                st.text_area("Raw detail", _r.raw_text[:600], height=100, key=f"rlog_{mid}")
                     innings = st.radio("Innings",[1,2],horizontal=True,
                                        index=max(0,score_d.get("innings",1)-1),
                                        format_func=lambda x:"1st" if x==1 else "2nd",
@@ -1303,7 +1316,7 @@ elif page == "👁 In-play engine":
         ORDER BY date, step
     """, (yest, nxt7)).fetchall()
 
-    mode = st.radio("",
+    mode = st.radio("Match source",
         ["📅 This week (yesterday + 7 days)", "✏️ Enter teams manually"],
         horizontal=True, key="ip_mode", label_visibility="collapsed"
     )
@@ -1390,9 +1403,11 @@ elif page == "👁 In-play engine":
                 try:
                     sys.path.insert(0, os.path.join(ROOT, "scripts"))
                     from score_fetcher import fetch_live_score
+                    _api_key = st.secrets["ANTHROPIC_API_KEY"] if "ANTHROPIC_API_KEY" in st.secrets else os.environ.get("ANTHROPIC_API_KEY","")
                     res = fetch_live_score(
                         sm_ip["team_a"], sm_ip["team_b"],
-                        sm_ip["date"], fmt_ip
+                        sm_ip["date"], fmt_ip,
+                        api_key=_api_key
                     )
                     if res.success:
                         fetched = {
@@ -1415,13 +1430,34 @@ elif page == "👁 In-play engine":
                         if res.result_str:
                             fetch_status.info(f"🏆 {res.result_str}")
                     else:
+                        err_detail = res.raw_text or res.error or "Unknown error"
                         fetch_status.warning(
-                            f"Could not fetch automatically. "
-                            f"Paste the score text below instead.\n\n"
-                            f"Tried: cricketdata.org → ESPN → Cricbuzz → Claude search"
+                            f"⚠️ Auto-fetch failed. Enter score manually below.\n\n"
+                            f"**Debug:** {err_detail[:200]}"
                         )
+                    st.session_state["ip_fetch_log"] = res
                 except Exception as e:
+                    res = type("R",(),{"success":False,"source":"exception","error":str(e),"raw_text":""})()
                     fetch_status.warning(f"Fetch error: {e}")
+                    st.session_state["ip_fetch_log"] = res
+
+    # ── Fetch log expander ─────────────────────────────────
+    if "ip_fetch_log" in st.session_state:
+        _lr = st.session_state["ip_fetch_log"]
+        with st.expander("🔍 Fetch log — click to see what was tried", expanded=not _lr.success):
+            c1,c2 = st.columns(2)
+            c1.metric("Source", getattr(_lr,"source","none") or "none")
+            c2.metric("Success", "✅ Yes" if getattr(_lr,"success",False) else "❌ No")
+            if getattr(_lr,"error",""):
+                st.error(f"Error: {_lr.error}")
+            if getattr(_lr,"raw_text",""):
+                st.text_area("Raw detail (all sources tried)", _lr.raw_text[:600],
+                             height=120, key="ip_rlog", disabled=True)
+            if not getattr(_lr,"success",False):
+                st.info(
+                    "💡 To enable auto-fetch: go to **Manage app → Settings → Secrets** "
+                    "and add:\n```\nANTHROPIC_API_KEY = \"sk-ant-...\"\n```"
+                )
 
     st.caption("Values pre-filled from fetch if available — adjust as needed")
 
