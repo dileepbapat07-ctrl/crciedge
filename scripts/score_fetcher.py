@@ -362,9 +362,143 @@ def _try_espn(team_a: str, team_b: str, match_date: str) -> ScoreResult:
 # ── Strategy 3: Cricbuzz unofficial ──────────────────────────
 def _try_cricbuzz(team_a: str, team_b: str) -> ScoreResult:
     """
-    Cricbuzz live scores via their unofficial JSON API.
-    Handles 3 states: Live (has score), Upcoming (no score yet), Not found.
+    Try multiple free working cricket score sources.
+    1. cricbuzz-live.vercel.app — unofficial Cricbuzz wrapper, free, no key
+    2. mapps.cricbuzz.com — Cricbuzz mobile API
+    3. cricapi.com — 100k free hits/hour, no signup needed for basic
     """
+    if not HAS_REQUESTS:
+        return ScoreResult(error="requests not installed")
+
+    ta_key = team_a.lower().split()[-1]
+    tb_key = team_b.lower().split()[-1]
+
+    headers = {**HEADERS, "Accept": "application/json, */*"}
+
+    # ── Source 1: cricbuzz-live.vercel.app (no key, free) ─────
+    try:
+        # Get list of live matches
+        r = requests.get(
+            "https://cricbuzz-live.vercel.app/v1/matches",
+            headers=headers, timeout=6
+        )
+        if r.status_code == 200:
+            data = r.json()
+            matches = data.get("data", {}).get("matches", []) or data.get("matches", [])
+            for m in matches:
+                title = (m.get("title","") or "").lower()
+                if ta_key in title and tb_key in title:
+                    match_id = m.get("id","")
+                    if match_id:
+                        # Fetch detailed score for this match
+                        r2 = requests.get(
+                            f"https://cricbuzz-live.vercel.app/v1/score/{match_id}",
+                            headers=headers, timeout=6
+                        )
+                        if r2.status_code == 200:
+                            d2 = r2.json().get("data",{})
+                            live_score = d2.get("liveScore","")
+                            update     = d2.get("update","")
+                            state      = (d2.get("state","") or update or "").lower()
+
+                            # Check if not started
+                            if "yet to begin" in state or "upcoming" in state:
+                                return ScoreResult(
+                                    success=False,
+                                    match_status="NotStarted",
+                                    error="Match has not started yet"
+                                )
+
+                            # Parse the live score string e.g. "GG 155/5 (18.2)"
+                            if live_score:
+                                res = parse_score_from_text(
+                                    f"{live_score} {update}", team_a, team_b
+                                )
+                                if res.success:
+                                    res.source = "Cricbuzz"
+                                    if "won" in update.lower():
+                                        res.result_str   = update
+                                        res.match_status = "Complete"
+                                    return res
+    except Exception as e:
+        pass
+
+    # ── Source 2: mapps.cricbuzz.com mobile API ────────────────
+    try:
+        r = requests.get(
+            "https://mapps.cricbuzz.com/cbzios/match/livematches",
+            headers={**headers, "App-Id": "com.cricbuzz.cricket"},
+            timeout=6
+        )
+        if r.status_code == 200:
+            data = r.json()
+            for match in data.get("matchMap", {}).values():
+                header = match.get("matchHeader", {})
+                ta_name = header.get("team1", {}).get("shortName","").lower()
+                tb_name = header.get("team2", {}).get("shortName","").lower()
+                if ta_key in ta_name+tb_name and tb_key in ta_name+tb_name:
+                    state = header.get("state","").lower()
+                    if "upcoming" in state or "preview" in state:
+                        return ScoreResult(
+                            success=False, match_status="NotStarted",
+                            error="Match has not started yet"
+                        )
+                    # Get score from miniscore
+                    ms = match.get("miniscore", {})
+                    bat_score = ms.get("batTeam", {})
+                    runs = bat_score.get("teamScore", 0)
+                    wkts = bat_score.get("teamWkts", 0)
+                    overs= ms.get("overs", 0)
+                    if runs:
+                        res = ScoreResult(success=True, source="Cricbuzz")
+                        res.score      = int(runs)
+                        res.wickets    = int(wkts)
+                        res.balls_done = int(float(overs)*6)
+                        res.overs_str  = str(overs)
+                        return res
+    except Exception:
+        pass
+
+    # ── Source 3: cricapi.com (100k free hits/hour) ─────────────
+    try:
+        r = requests.get(
+            "https://api.cricapi.com/v1/currentMatches?apikey=free&offset=0",
+            headers=headers, timeout=6
+        )
+        if r.status_code == 200:
+            data = r.json()
+            if data.get("status") == "success":
+                for m in data.get("data", []):
+                    teams = " ".join(m.get("teams", [])).lower()
+                    if ta_key in teams and tb_key in teams:
+                        scores = m.get("score", [])
+                        status = m.get("status", "").lower()
+                        if "yet to begin" in status or not scores:
+                            return ScoreResult(
+                                success=False, match_status="NotStarted",
+                                error="Match has not started yet"
+                            )
+                        if scores:
+                            latest = scores[-1]
+                            res = ScoreResult(success=True, source="CricAPI")
+                            res.score      = latest.get("r", 0)
+                            res.wickets    = latest.get("w", 0)
+                            ov = str(latest.get("o", 0))
+                            res.overs_str  = ov
+                            res.balls_done = overs_to_balls(ov)
+                            res.innings    = len(scores)
+                            res.match_status = m.get("status","")
+                            if "won" in status:
+                                res.result_str   = m.get("status","")
+                                res.match_status = "Complete"
+                            return res
+    except Exception:
+        pass
+
+    return ScoreResult(
+        error="Cricbuzz/CricAPI: match not found in live feeds",
+        raw_text=f"Searched for '{ta_key}' and '{tb_key}'"
+    )
     if not HAS_REQUESTS:
         return ScoreResult(error="requests not installed")
 
@@ -521,17 +655,21 @@ def _try_claude_search(team_a: str, team_b: str, match_date: str,
             "messages": [{
                 "role": "user",
                 "content": (
-                    f"Search for the live cricket score: {team_a} vs {team_b} "
-                    f"on {match_date}. "
+                    f"Search for the cricket match result or live score: "
+                    f"{team_a} vs {team_b} on {match_date}. "
+                    f"This could be a completed match or live match. "
                     f"Reply ONLY in this exact structured format (no other text):\n"
-                    f"SCORE: runs/wickets\n"
-                    f"BALLS: balls_completed\n"
-                    f"INNINGS: 1 or 2\n"
-                    f"TARGET: runs_needed_to_win (only if 2nd innings, else omit)\n"
-                    f"BATTING: team_name_batting_now\n"
+                    f"SCORE1: runs/wickets  (team batting first final score)\n"
+                    f"TEAM1: team_name_that_batted_first\n"
+                    f"SCORE2: runs/wickets  (team batting second score, or 'innings not started')\n"
+                    f"TEAM2: team_name_that_batted_second\n"
+                    f"BALLS: balls_completed_in_current_or_last_innings\n"
+                    f"INNINGS: 1 or 2  (which innings is current or was last)\n"
+                    f"TARGET: runs (only if 2nd innings)\n"
                     f"STATUS: Live or Complete or NotStarted\n"
-                    f"RESULT: result_string (only if complete, else omit)\n\n"
-                    f"If match has not started yet, reply:\n"
+                    f"RESULT: result_string (e.g. 'Welsh Fire won by 6 wickets') if complete\n"
+                    f"BATTING: team currently batting (if live)\n\n"
+                    f"If match has not started:\n"
                     f"STATUS: NotStarted\n"
                     f"TOSS: winner elected to bat/field (if known)"
                 )
@@ -555,10 +693,14 @@ def _try_claude_search(team_a: str, team_b: str, match_date: str,
                        if b.get("type") == "text"]
         response_text = "\n".join(text_blocks)
 
-        # Parse structured response
         res = ScoreResult(source="Claude web search")
 
-        score_m  = re.search(r"SCORE:\s*(\d+)/(\d+)", response_text)
+        # Parse structured response
+        score1_m = re.search(r"SCORE1:\s*(\d+)/(\d+)", response_text)
+        score2_m = re.search(r"SCORE2:\s*(\d+)/(\d+)", response_text)
+        team1_m  = re.search(r"TEAM1:\s*(.+)", response_text)
+        team2_m  = re.search(r"TEAM2:\s*(.+)", response_text)
+        score_m  = re.search(r"^SCORE:\s*(\d+)/(\d+)", response_text, re.MULTILINE)
         balls_m  = re.search(r"BALLS:\s*(\d+)", response_text)
         inn_m    = re.search(r"INNINGS:\s*(\d)", response_text)
         tgt_m    = re.search(r"TARGET:\s*(\d+)", response_text)
@@ -567,10 +709,32 @@ def _try_claude_search(team_a: str, team_b: str, match_date: str,
         result_m = re.search(r"RESULT:\s*(.+)", response_text)
         toss_m   = re.search(r"TOSS:\s*(.+)", response_text)
 
-        if score_m:
-            res.score    = int(score_m.group(1))
-            res.wickets  = int(score_m.group(2))
-            res.success  = True
+        if status_m:
+            res.match_status = status_m.group(1).strip()
+
+        # Completed match — show both innings
+        if score1_m and score2_m:
+            res.score   = int(score2_m.group(1))  # show 2nd innings as "current"
+            res.wickets = int(score2_m.group(2))
+            res.innings = 2
+            res.success = True
+            if team2_m:
+                res.batting_team = team2_m.group(1).strip()
+                res.bowling_team = team1_m.group(1).strip() if team1_m else team_a
+            # Build result string showing both scores
+            t1 = team1_m.group(1).strip() if team1_m else team_a
+            t2 = team2_m.group(1).strip() if team2_m else team_b
+            s1 = f"{score1_m.group(1)}/{score1_m.group(2)}"
+            s2 = f"{score2_m.group(1)}/{score2_m.group(2)}"
+            if result_m:
+                res.result_str = result_m.group(1).strip()
+            # Put full scorecard in match_status for display
+            res.match_status = f"Complete — {t1} {s1} | {t2} {s2}"
+        elif score_m:
+            res.score   = int(score_m.group(1))
+            res.wickets = int(score_m.group(2))
+            res.success = True
+
         if balls_m:
             res.balls_done = int(balls_m.group(1))
             res.overs_str  = f"{res.balls_done//6}.{res.balls_done%6}"
@@ -579,20 +743,18 @@ def _try_claude_search(team_a: str, team_b: str, match_date: str,
         if tgt_m:
             res.target     = int(tgt_m.group(1))
             res.runs_needed= res.target - res.score if res.score else None
-        if bat_m:
+        if bat_m and not res.batting_team:
             res.batting_team = bat_m.group(1).strip()
             res.bowling_team = (team_b if res.batting_team.lower() in team_a.lower()
                                else team_a)
-        if status_m:
-            res.match_status = status_m.group(1).strip()
-            if res.match_status == "NotStarted":
-                res.success = False
-                res.error   = "Match has not started yet"
-                if toss_m:
-                    res.toss_winner = toss_m.group(1).strip()
-        if result_m:
+        if result_m and not res.result_str:
             res.result_str = result_m.group(1).strip()
-            res.match_status = "Complete"
+        if toss_m:
+            res.toss_winner = toss_m.group(1).strip()
+
+        if res.match_status == "NotStarted":
+            res.success = False
+            res.error = "Match has not started yet"
 
         if not res.success and not res.error:
             res.error = f"Could not parse response: {response_text[:200]}"
@@ -614,12 +776,25 @@ def fetch_live_score(
     """
     Try 4 strategies in order, return first success.
     """
+    import datetime as _dt
+
+    # Determine if match is in the past — if so, skip "NotStarted" returns
+    try:
+        match_dt  = _dt.date.fromisoformat(match_date)
+        is_past   = match_dt < _dt.date.today()
+        is_today  = match_dt == _dt.date.today()
+    except Exception:
+        is_past  = False
+        is_today = True
+
     # Strategy 0: user pasted text
     if text_input and len(text_input) > 10:
         res = parse_score_from_text(text_input, team_a, team_b)
         if res.success:
             res.source = "pasted text"
             return res
+
+    errors = []
 
     errors = []
 
@@ -631,19 +806,29 @@ def fetch_live_score(
     ]:
         if fn_result.success:
             return fn_result
-        if fn_result.match_status == "NotStarted":
+        if fn_result.match_status == "NotStarted" and not is_past:
             fn_result.error = fn_result.error or "Match has not started yet"
             return fn_result
         errors.append(f"{name}: {fn_result.error}")
 
-    # Strategy 4: Claude web search
+    # Strategy 4: Claude web search — works for both live AND completed matches
     res = _try_claude_search(team_a, team_b, match_date, api_key)
     if res.success:
         return res
-    if res.match_status == "NotStarted":
+    if res.match_status == "NotStarted" and not is_past:
         res.error = res.error or "Match has not started yet"
         return res
     errors.append(f"Claude: {res.error}")
+
+    # If past match and nothing found — give a specific message
+    if is_past:
+        return ScoreResult(
+            success=False,
+            error=f"Match was yesterday/earlier. Sources returned stale pre-match data. Enter result manually or log it via ✏️ Log result.",
+            raw_text="\n".join(errors),
+            source="none",
+            match_status="Complete"
+        )
 
     return ScoreResult(
         success=False,
