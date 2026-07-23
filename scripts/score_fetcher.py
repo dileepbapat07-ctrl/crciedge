@@ -362,27 +362,88 @@ def _try_espn(team_a: str, team_b: str, match_date: str) -> ScoreResult:
 # ── Strategy 3: Cricbuzz unofficial ──────────────────────────
 def _try_cricbuzz(team_a: str, team_b: str) -> ScoreResult:
     """
-    Cricbuzz has an unofficial JSON endpoint used by many apps.
+    Cricbuzz live scores via their unofficial JSON API.
+    Tries multiple endpoints in order.
     """
     if not HAS_REQUESTS:
         return ScoreResult(error="requests not installed")
-    try:
-        # Unofficial Cricbuzz live scores endpoint
-        r = requests.get(
-            "https://www.cricbuzz.com/api/cricket-match/commentary/",
-            headers={**HEADERS, "Referer": "https://www.cricbuzz.com/"},
-            timeout=6
-        )
-        if r.status_code == 200:
-            text = r.text
-            parsed = parse_score_from_text(text, team_a, team_b)
+
+    ta_key = team_a.lower().split()[-1]  # last word e.g. "brave", "fire", "india"
+    tb_key = team_b.lower().split()[-1]
+
+    endpoints = [
+        # Cricbuzz live matches JSON
+        "https://www.cricbuzz.com/api/cricket-match/live/matches",
+        # Cricbuzz scores feed
+        "https://www.cricbuzz.com/cricket-match/live-scores",
+        # Cricbuzz match list API
+        "https://www.cricbuzz.com/api/matches",
+    ]
+
+    cb_headers = {
+        **HEADERS,
+        "Referer":  "https://www.cricbuzz.com/",
+        "Accept":   "application/json, text/html, */*",
+        "Origin":   "https://www.cricbuzz.com",
+    }
+
+    for url in endpoints:
+        try:
+            r = requests.get(url, headers=cb_headers, timeout=6)
+            if r.status_code != 200:
+                continue
+
+            content = r.text
+
+            # Try JSON parse first
+            try:
+                import json as _json
+                data = _json.loads(content)
+                # Walk the JSON looking for our match
+                def find_match(obj, depth=0):
+                    if depth > 8:
+                        return None
+                    if isinstance(obj, dict):
+                        # Check if this is a match object with our teams
+                        teams_str = str(obj).lower()
+                        if ta_key in teams_str and tb_key in teams_str:
+                            # Extract score fields
+                            score = obj.get("score","") or obj.get("bat1Score","") or \
+                                    obj.get("batScore","") or obj.get("currentScore","")
+                            if score:
+                                res = parse_score_from_text(str(score), team_a, team_b)
+                                if res.success:
+                                    return res
+                        for v in obj.values():
+                            found = find_match(v, depth+1)
+                            if found:
+                                return found
+                    elif isinstance(obj, list):
+                        for item in obj:
+                            found = find_match(item, depth+1)
+                            if found:
+                                return found
+                    return None
+
+                result = find_match(data)
+                if result:
+                    result.source = "Cricbuzz"
+                    return result
+
+            except Exception:
+                pass
+
+            # Fallback: text parse
+            parsed = parse_score_from_text(content, team_a, team_b)
             if parsed.success:
                 parsed.source = "Cricbuzz"
                 return parsed
 
-        return ScoreResult(error=f"Cricbuzz HTTP {r.status_code}")
-    except Exception as e:
-        return ScoreResult(error=f"Cricbuzz exception: {e}")
+        except Exception:
+            continue
+
+    return ScoreResult(error="Cricbuzz: no score found in any endpoint",
+                       raw_text=f"Tried endpoints: {', '.join(endpoints)}")
 
 # ── Strategy 4: Claude-powered search (via Anthropic API) ─────
 def _try_claude_search(team_a: str, team_b: str, match_date: str,
@@ -398,15 +459,18 @@ def _try_claude_search(team_a: str, team_b: str, match_date: str,
     # Get API key from environment or passed parameter
     key = api_key or os.environ.get("ANTHROPIC_API_KEY", "")
     if not key:
-        # Try to get from streamlit secrets
         try:
             import streamlit as st
-            key = st.secrets.get("ANTHROPIC_API_KEY", "")
+            # Streamlit secrets — try dict-style access first
+            try:
+                key = st.secrets["ANTHROPIC_API_KEY"]
+            except (KeyError, AttributeError):
+                key = st.secrets.get("ANTHROPIC_API_KEY", "") if hasattr(st.secrets, "get") else ""
         except Exception:
             pass
 
     if not key:
-        return ScoreResult(error="No ANTHROPIC_API_KEY found in environment or secrets")
+        return ScoreResult(error="No ANTHROPIC_API_KEY found in environment or Streamlit secrets. Add it via Manage App → Settings → Secrets")
 
     try:
         payload = {
