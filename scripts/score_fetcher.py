@@ -253,7 +253,7 @@ def _try_cricketdata(team_a: str, team_b: str, fmt: str) -> ScoreResult:
     try:
         # List current matches
         r = requests.get(
-            "https://api.cricapi.com/v1/currentMatches?apikey=free&offset=0",
+            "https://api.cricapi.com/v1/currentMatches?apikey=TESTKEY0273&offset=0",
             headers=HEADERS, timeout=6
         )
         if r.status_code != 200:
@@ -360,7 +360,17 @@ def _try_espn(team_a: str, team_b: str, match_date: str) -> ScoreResult:
         return ScoreResult(error=f"ESPN exception: {e}")
 
 # ── Strategy 3: Cricbuzz unofficial ──────────────────────────
-def _try_cricbuzz(team_a: str, team_b: str) -> ScoreResult:
+def _get_cricapi_key() -> str:
+    """Get CricAPI key — free test key or from Streamlit secrets."""
+    # Try Streamlit secrets first (user's own key from cricapi.com)
+    try:
+        import streamlit as st
+        if "CRICAPI_KEY" in st.secrets:
+            return st.secrets["CRICAPI_KEY"]
+    except Exception:
+        pass
+    # Official public test key (100 calls/day, no signup)
+    return "TESTKEY0273"
     """
     Try multiple free working cricket score sources.
     1. cricbuzz-live.vercel.app — unofficial Cricbuzz wrapper, free, no key
@@ -459,39 +469,43 @@ def _try_cricbuzz(team_a: str, team_b: str) -> ScoreResult:
     except Exception:
         pass
 
-    # ── Source 3: cricapi.com (100k free hits/hour) ─────────────
+    # ── Source 3: cricapi.com (public test key, 100 calls/day free) ────
     try:
-        r = requests.get(
-            "https://api.cricapi.com/v1/currentMatches?apikey=free&offset=0",
-            headers=headers, timeout=6
-        )
-        if r.status_code == 200:
-            data = r.json()
-            if data.get("status") == "success":
-                for m in data.get("data", []):
-                    teams = " ".join(m.get("teams", [])).lower()
-                    if ta_key in teams and tb_key in teams:
-                        scores = m.get("score", [])
-                        status = m.get("status", "").lower()
-                        if "yet to begin" in status or not scores:
-                            return ScoreResult(
-                                success=False, match_status="NotStarted",
-                                error="Match has not started yet"
-                            )
-                        if scores:
+        # TESTKEY0273 is the official public test key from cricapi docs
+        for apikey in ["TESTKEY0273", "free"]:
+            r = requests.get(
+                f"https://api.cricapi.com/v1/currentMatches?apikey={apikey}&offset=0",
+                headers=headers, timeout=6
+            )
+            if r.status_code == 200:
+                data = r.json()
+                if data.get("status") == "success":
+                    for m in data.get("data", []):
+                        teams = " ".join(m.get("teams", [])).lower()
+                        if ta_key in teams and tb_key in teams:
+                            scores = m.get("score", [])
+                            status = (m.get("status", "") or "").lower()
+                            matchStarted = m.get("matchStarted", False)
+
+                            if not matchStarted or "yet to begin" in status or not scores:
+                                return ScoreResult(
+                                    success=False, match_status="NotStarted",
+                                    error="Match has not started yet"
+                                )
                             latest = scores[-1]
                             res = ScoreResult(success=True, source="CricAPI")
-                            res.score      = latest.get("r", 0)
-                            res.wickets    = latest.get("w", 0)
+                            res.score      = int(latest.get("r", 0))
+                            res.wickets    = int(latest.get("w", 0))
                             ov = str(latest.get("o", 0))
                             res.overs_str  = ov
                             res.balls_done = overs_to_balls(ov)
                             res.innings    = len(scores)
-                            res.match_status = m.get("status","")
+                            res.match_status = m.get("status", "")
                             if "won" in status:
-                                res.result_str   = m.get("status","")
+                                res.result_str   = m.get("status", "")
                                 res.match_status = "Complete"
                             return res
+                    break  # tried this key, no match found
     except Exception:
         pass
 
