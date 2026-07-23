@@ -1138,9 +1138,16 @@ elif page == "🔴 Match dashboard":
                                 )
                                 if res.result_str:
                                     ref_status.info(f"🏆 {res.result_str}")
+                            elif res.match_status == "NotStarted":
+                                ref_status.info(
+                                    f"⏳ Match has not started yet."
+                                    + (f" Toss: **{res.toss_winner}** elected to **{res.toss_choice}**"
+                                       if res.toss_winner else "")
+                                    + f"\n\n{res.error or ''}"
+                                )
                             else:
                                 ref_status.warning(
-                                    f"⚠️ Could not fetch automatically (external APIs blocked on Streamlit Cloud). Add ANTHROPIC_API_KEY to Streamlit secrets for auto-fetch, or paste the score below."
+                                    f"⚠️ Could not fetch automatically. Add ANTHROPIC_API_KEY to Streamlit secrets, or enter manually below.\n\nDebug: {res.raw_text[:200] if res.raw_text else res.error}"
                                 )
                         except Exception as e:
                             ref_status.warning(f"Fetch error: {e}")
@@ -1429,11 +1436,17 @@ elif page == "👁 In-play engine":
                         )
                         if res.result_str:
                             fetch_status.info(f"🏆 {res.result_str}")
+                    elif res.match_status == "NotStarted":
+                        fetch_status.info(
+                            f"⏳ Match has not started yet."
+                            + (f" Toss: **{res.toss_winner}** elected to **{res.toss_choice}**" if res.toss_winner else "")
+                            + f"\n\n{res.error or ''}"
+                        )
                     else:
                         err_detail = res.raw_text or res.error or "Unknown error"
                         fetch_status.warning(
                             f"⚠️ Auto-fetch failed. Enter score manually below.\n\n"
-                            f"**Debug:** {err_detail[:200]}"
+                            f"**Debug:** {err_detail[:300]}"
                         )
                     st.session_state["ip_fetch_log"] = res
                 except Exception as e:
