@@ -1105,52 +1105,78 @@ elif page == "🔴 Match dashboard":
                 score_d = S["score"]
 
                 # Refresh button
-                rc1,rc2 = st.columns([1,4])
+                import datetime as _dt2
+                match_is_past = False
+                try:
+                    match_is_past = _dt2.date.fromisoformat(match["date"]) < _dt2.date.today()
+                except Exception:
+                    pass
+
+                rc1, rc2 = st.columns([1, 4])
                 with rc1:
-                    do_refresh = st.button("🔄 Refresh score",
-                                           type="primary", key=f"{sk}_ref")
+                    btn_label = "🔍 Get result" if match_is_past else "🔄 Refresh score"
+                    do_refresh = st.button(btn_label, type="primary", key=f"{sk}_ref")
                 with rc2:
                     ref_status = st.empty()
 
                 if do_refresh:
-                    with ref_status, st.spinner("Fetching live score..."):
+                    spinner_msg = "Looking up result..." if match_is_past else "Fetching live score..."
+                    with ref_status, st.spinner(spinner_msg):
                         try:
-                            sys.path.insert(0, os.path.join(ROOT, "scripts"))
-                            from score_fetcher import fetch_live_score
-                            api_key = st.secrets["ANTHROPIC_API_KEY"] if "ANTHROPIC_API_KEY" in st.secrets else os.environ.get("ANTHROPIC_API_KEY","")
-                            from score_fetcher import fetch_live_score
-                            res = fetch_live_score(ta, tb, match["date"], fmt, api_key=api_key)
-                            st.session_state[f"fetch_log_{mid}"] = res
-                            if res.success:
-                                fetched = dict(score_d)
-                                fetched["score"]      = res.score
-                                fetched["wickets"]    = res.wickets
-                                fetched["balls_done"] = res.balls_done
-                                if res.innings: fetched["innings"] = res.innings
-                                if res.target:  fetched["target"]  = res.target
-                                S["score"] = fetched
-                                score_d    = fetched
-                                ov = res.overs_str or f"{res.balls_done//6}.{res.balls_done%6}"
-                                ref_status.success(
-                                    f"✅ {res.score}/{res.wickets} ({ov} ov) "
-                                    f"via {res.source}"
-                                    + (f" · Target {res.target}" if res.target else "")
-                                )
-                                if res.result_str:
-                                    ref_status.info(f"🏆 {res.result_str}")
-                            elif res.match_status == "NotStarted":
+                            import requests as _rq2
+                            _ak = (st.secrets["ANTHROPIC_API_KEY"]
+                                   if "ANTHROPIC_API_KEY" in st.secrets
+                                   else os.environ.get("ANTHROPIC_API_KEY",""))
+
+                            if match_is_past:
+                                # Completed match — paste text to parse, or redirect to Log result
+                                # No API call needed — user can paste the scorecard text below
                                 ref_status.info(
-                                    f"⏳ Match has not started yet."
-                                    + (f" Toss: **{res.toss_winner}** elected to **{res.toss_choice}**"
-                                       if res.toss_winner else "")
-                                    + f"\n\n{res.error or ''}"
+                                    f"⏰ **{ta} vs {tb}** — {match['date']} is a completed match.\n\n"
+                                    f"**Option 1:** Paste the scorecard text in the box below — "
+                                    f"the parser will extract the score automatically.\n\n"
+                                    f"**Option 2:** Go to **✏️ Log result** in the sidebar to record the outcome."
                                 )
                             else:
-                                ref_status.warning(
-                                    f"⚠️ Could not fetch automatically. Add ANTHROPIC_API_KEY to Streamlit secrets, or enter manually below.\n\nDebug: {res.raw_text[:200] if res.raw_text else res.error}"
-                                )
+                                # Live match — use normal fetcher
+                                sys.path.insert(0, os.path.join(ROOT, "scripts"))
+                                from score_fetcher import fetch_live_score
+                                res = fetch_live_score(ta, tb, match["date"], fmt, api_key=_ak)
+                                st.session_state[f"fetch_log_{mid}"] = res
+                                if res.success:
+                                    fetched = dict(score_d)
+                                    fetched["score"]      = res.score
+                                    fetched["wickets"]    = res.wickets
+                                    fetched["balls_done"] = res.balls_done
+                                    if res.innings: fetched["innings"] = res.innings
+                                    if res.target:  fetched["target"]  = res.target
+                                    S["score"] = fetched
+                                    score_d    = fetched
+                                    ov = res.overs_str or f"{res.balls_done//6}.{res.balls_done%6}"
+                                    ref_status.success(
+                                        f"✅ {res.score}/{res.wickets} ({ov} ov) via {res.source}"
+                                        + (f" · Target {res.target}" if res.target else "")
+                                    )
+                                    if res.result_str:
+                                        ref_status.info(f"🏆 {res.result_str}")
+                                elif res.match_status == "NotStarted":
+                                    ref_status.info(
+                                        f"⏳ Match has not started yet."
+                                        + (f" Toss: **{res.toss_winner}** elected to **{res.toss_choice}**"
+                                           if res.toss_winner else "")
+                                    )
+                                elif res.match_status and res.match_status.startswith("Complete"):
+                                    ref_status.success(f"✅ {res.match_status}")
+                                    if res.result_str:
+                                        ref_status.info(f"🏆 {res.result_str}")
+                                else:
+                                    ref_status.warning(
+                                        f"⚠️ {res.error or 'Could not fetch'}\n\n"
+                                        f"{res.raw_text[:200] if res.raw_text else ''}"
+                                    )
                         except Exception as e:
                             ref_status.warning(f"Fetch error: {e}")
+
                     # Show fetch log
                     log_key = f"fetch_log_{mid}"
                     if log_key in st.session_state:
@@ -1166,7 +1192,28 @@ elif page == "🔴 Match dashboard":
                                        index=max(0,score_d.get("innings",1)-1),
                                        format_func=lambda x:"1st" if x==1 else "2nd",
                                        key=f"{sk}_inn")
-                    # Auto-set batting from toss
+                    # For completed matches — paste scorecard to auto-parse
+                if match_is_past:
+                    paste_text = st.text_area(
+                        "📋 Paste scorecard text to auto-fill (e.g. from Cricbuzz/ESPNcricinfo)",
+                        placeholder="Sri Lanka Women 210/9 (50 ov) · Pakistan Women 211/5 (43 ov) · PAK Women won by 5 wickets",
+                        height=60, key=f"{sk}_paste"
+                    )
+                    if paste_text and len(paste_text) > 10:
+                        sys.path.insert(0, os.path.join(ROOT, "scripts"))
+                        from score_fetcher import parse_score_from_text
+                        parsed = parse_score_from_text(paste_text, ta, tb)
+                        if parsed.success:
+                            score_d["score"]      = parsed.score
+                            score_d["wickets"]    = parsed.wickets
+                            if parsed.balls_done: score_d["balls_done"] = parsed.balls_done
+                            if parsed.target:     score_d["target"]     = parsed.target
+                            if parsed.innings:    score_d["innings"]    = parsed.innings
+                            S["score"] = score_d
+                            st.success(f"✅ Parsed: {parsed.score}/{parsed.wickets}"
+                                      + (f" · {parsed.result_str}" if parsed.result_str else ""))
+
+                # Auto-set batting from toss
                     bat_opts = [ta, tb]
                     bat_idx  = 0
                     if S["toss"] and innings==1:
@@ -1440,13 +1487,14 @@ elif page == "👁 In-play engine":
                         fetch_status.info(
                             f"⏳ Match has not started yet."
                             + (f" Toss: **{res.toss_winner}** elected to **{res.toss_choice}**" if res.toss_winner else "")
-                            + f"\n\n{res.error or ''}"
                         )
+                    elif res.match_status and res.match_status.startswith("Complete"):
+                        fetch_status.success(f"✅ Match complete — {res.match_status}")
+                        if res.result_str:
+                            fetch_status.info(f"🏆 {res.result_str}")
                     else:
-                        err_detail = res.raw_text or res.error or "Unknown error"
                         fetch_status.warning(
-                            f"⚠️ Auto-fetch failed. Enter score manually below.\n\n"
-                            f"**Debug:** {err_detail[:300]}"
+                            f"⚠️ {res.error or 'Could not fetch'}\n\n{res.raw_text[:200] if res.raw_text else ''}"
                         )
                     st.session_state["ip_fetch_log"] = res
                 except Exception as e:
