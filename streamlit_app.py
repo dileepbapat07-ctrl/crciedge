@@ -1129,14 +1129,27 @@ elif page == "🔴 Match dashboard":
                                    else os.environ.get("ANTHROPIC_API_KEY",""))
 
                             if match_is_past:
-                                # Completed match — paste text to parse, or redirect to Log result
-                                # No API call needed — user can paste the scorecard text below
-                                ref_status.info(
-                                    f"⏰ **{ta} vs {tb}** — {match['date']} is a completed match.\n\n"
-                                    f"**Option 1:** Paste the scorecard text in the box below — "
-                                    f"the parser will extract the score automatically.\n\n"
-                                    f"**Option 2:** Go to **✏️ Log result** in the sidebar to record the outcome."
-                                )
+                                # Completed match — scrape ESPN/Cricbuzz directly, no credits
+                                with st.spinner("Searching ESPN / Cricbuzz for result..."):
+                                    try:
+                                        sys.path.insert(0, os.path.join(ROOT, "scripts"))
+                                        from espn_results import fetch_match_result
+                                        _cd_key = st.secrets.get("CRICKETDATA_KEY","TESTKEY0273") if hasattr(st,"secrets") else "TESTKEY0273"
+                                        _res = fetch_match_result(ta, tb, match["date"], _cd_key)
+                                        if _res and _res.winner:
+                                            if _res.score1 and _res.score2:
+                                                ref_status.success(
+                                                    f"**{_res.team1 or ta}**: {_res.score1}\n\n"
+                                                    f"**{_res.team2 or tb}**: {_res.score2}"
+                                                )
+                                            ref_status.info(f"🏆 {_res.result_str} [{_res.source}]")
+                                        else:
+                                            ref_status.warning(
+                                                "Not found via ESPN/Cricbuzz (may still be processing). "
+                                                "Paste scorecard below or use ✏️ Log result."
+                                            )
+                                    except Exception as _ex:
+                                        ref_status.warning(f"Lookup error: {_ex}")
                             else:
                                 # Live match — use normal fetcher
                                 sys.path.insert(0, os.path.join(ROOT, "scripts"))
@@ -3284,10 +3297,7 @@ elif page == "⚙️ Settings & updates":
 
         st.caption(f"Last refresh: {dt.datetime.now().strftime('%A %d %b %Y %H:%M')}")
 
-    st.divider()
 
-    # ── Config settings ────────────────────────────────────────
-    st.subheader("⚙️ Engine configuration")
 
     col1, col2 = st.columns(2)
     with col1:
