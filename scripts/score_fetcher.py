@@ -243,6 +243,16 @@ def parse_score_from_text(text: str, team_a: str = "", team_b: str = "") -> Scor
     return r
 
 # ── Strategy 1: cricketdata.org ───────────────────────────────
+def _get_cricketdata_key() -> str:
+    """Get cricketdata.org API key from Streamlit secrets or use test key."""
+    try:
+        import streamlit as st
+        if "CRICKETDATA_KEY" in st.secrets:
+            return st.secrets["CRICKETDATA_KEY"]
+    except Exception:
+        pass
+    return "TESTKEY0273"  # fallback public test key
+
 def _try_cricketdata(team_a: str, team_b: str, fmt: str) -> ScoreResult:
     """
     cricketdata.org gives 500 free req/day.
@@ -251,9 +261,10 @@ def _try_cricketdata(team_a: str, team_b: str, fmt: str) -> ScoreResult:
     if not HAS_REQUESTS:
         return ScoreResult(error="requests not installed")
     try:
-        # List current matches
+        key = _get_cricketdata_key()
+        # cricketdata.org API — 500 free calls/day with registered key
         r = requests.get(
-            "https://api.cricapi.com/v1/currentMatches?apikey=TESTKEY0273&offset=0",
+            f"https://api.cricapi.com/v1/currentMatches?apikey={key}&offset=0",
             headers=HEADERS, timeout=6
         )
         if r.status_code != 200:
@@ -360,22 +371,12 @@ def _try_espn(team_a: str, team_b: str, match_date: str) -> ScoreResult:
         return ScoreResult(error=f"ESPN exception: {e}")
 
 # ── Strategy 3: Cricbuzz unofficial ──────────────────────────
-def _get_cricapi_key() -> str:
-    """Get CricAPI key — free test key or from Streamlit secrets."""
-    # Try Streamlit secrets first (user's own key from cricapi.com)
-    try:
-        import streamlit as st
-        if "CRICAPI_KEY" in st.secrets:
-            return st.secrets["CRICAPI_KEY"]
-    except Exception:
-        pass
-    # Official public test key (100 calls/day, no signup)
-    return "TESTKEY0273"
+
     """
     Try multiple free working cricket score sources.
     1. cricbuzz-live.vercel.app — unofficial Cricbuzz wrapper, free, no key
     2. mapps.cricbuzz.com — Cricbuzz mobile API
-    3. cricapi.com — 100k free hits/hour, no signup needed for basic
+    3. cricketdata.org — second attempt with different endpoint
     """
     if not HAS_REQUESTS:
         return ScoreResult(error="requests not installed")
@@ -469,10 +470,10 @@ def _get_cricapi_key() -> str:
     except Exception:
         pass
 
-    # ── Source 3: cricapi.com (public test key, 100 calls/day free) ────
+    # ── Source 3: cricketdata.org second attempt (different endpoint) ────
     try:
-        # TESTKEY0273 is the official public test key from cricapi docs
-        for apikey in ["TESTKEY0273", "free"]:
+        key3 = _get_cricketdata_key()
+        for apikey in [key3]:
             r = requests.get(
                 f"https://api.cricapi.com/v1/currentMatches?apikey={apikey}&offset=0",
                 headers=headers, timeout=6
