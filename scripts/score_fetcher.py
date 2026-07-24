@@ -370,13 +370,13 @@ def _try_espn(team_a: str, team_b: str, match_date: str) -> ScoreResult:
     except Exception as e:
         return ScoreResult(error=f"ESPN exception: {e}")
 
-# ── Strategy 3: Cricbuzz unofficial ──────────────────────────
-
+# ── Strategy 3: Cricbuzz / cricketdata.org ───────────────────
+def _try_cricbuzz(team_a: str, team_b: str) -> ScoreResult:
     """
     Try multiple free working cricket score sources.
     1. cricbuzz-live.vercel.app — unofficial Cricbuzz wrapper, free, no key
     2. mapps.cricbuzz.com — Cricbuzz mobile API
-    3. cricketdata.org — second attempt with different endpoint
+    3. cricketdata.org (api.cricapi.com) — second attempt with registered key
     """
     if not HAS_REQUESTS:
         return ScoreResult(error="requests not installed")
