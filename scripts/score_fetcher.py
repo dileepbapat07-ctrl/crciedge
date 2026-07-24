@@ -253,6 +253,29 @@ def _get_cricketdata_key() -> str:
         pass
     return "TESTKEY0273"  # fallback public test key
 
+
+def _team_keys(team_a: str, team_b: str):
+    """
+    Generate robust search keys for matching team names in API responses.
+    Handles "Sri Lanka Women" -> ["sri lanka", "sri", "lanka"]
+    Avoids using just "women" which matches every women's match.
+    """
+    def keys(name: str):
+        # Remove "Women", "Men", "W", suffixes
+        clean = name.lower()
+        clean = clean.replace(" women","").replace(" men","").strip()
+        clean = clean.replace("super giants","supergiant").replace(" ","-")
+        # Return meaningful words — skip single-char and generic words
+        words = [w for w in clean.replace("-"," ").split()
+                 if len(w) > 2 and w not in ("the","and","for")]
+        # First meaningful word is the primary key
+        primary = words[0] if words else clean[:4]
+        return primary, clean  # (primary_word, full_clean)
+
+    ta_p, ta_f = keys(team_a)
+    tb_p, tb_f = keys(team_b)
+    return ta_p, tb_p, ta_f, tb_f
+
 def _try_cricketdata(team_a: str, team_b: str, fmt: str) -> ScoreResult:
     """
     cricketdata.org gives 500 free req/day.
@@ -277,9 +300,9 @@ def _try_cricketdata(team_a: str, team_b: str, fmt: str) -> ScoreResult:
         # Find matching match
         ta_low = team_a.lower(); tb_low = team_b.lower()
         for match in data.get("data", []):
-            teams = [t.lower() for t in match.get("teams", [])]
-            if any(ta_low.split()[-1] in t for t in teams) and \
-               any(tb_low.split()[-1] in t for t in teams):
+            teams_str = " ".join(t.lower() for t in match.get("teams", []))
+            ta_p, tb_p, ta_f, tb_f = _team_keys(team_a, team_b)
+            if ta_p in teams_str and tb_p in teams_str:
                 # Found the match
                 score_list = match.get("score", [])
                 if not score_list:
@@ -396,9 +419,10 @@ def _try_cricbuzz(team_a: str, team_b: str) -> ScoreResult:
         if r.status_code == 200:
             data = r.json()
             matches = data.get("data", {}).get("matches", []) or data.get("matches", [])
+            ta_p, tb_p, ta_f, tb_f = _team_keys(team_a, team_b)
             for m in matches:
                 title = (m.get("title","") or "").lower()
-                if ta_key in title and tb_key in title:
+                if ta_p in title and tb_p in title:
                     match_id = m.get("id","")
                     if match_id:
                         # Fetch detailed score for this match
@@ -447,7 +471,8 @@ def _try_cricbuzz(team_a: str, team_b: str) -> ScoreResult:
                 header = match.get("matchHeader", {})
                 ta_name = header.get("team1", {}).get("shortName","").lower()
                 tb_name = header.get("team2", {}).get("shortName","").lower()
-                if ta_key in ta_name+tb_name and tb_key in ta_name+tb_name:
+                ta_p, tb_p, ta_f, tb_f = _team_keys(team_a, team_b)
+                if ta_p in ta_name+tb_name and tb_p in ta_name+tb_name:
                     state = header.get("state","").lower()
                     if "upcoming" in state or "preview" in state:
                         return ScoreResult(
@@ -483,7 +508,8 @@ def _try_cricbuzz(team_a: str, team_b: str) -> ScoreResult:
                 if data.get("status") == "success":
                     for m in data.get("data", []):
                         teams = " ".join(m.get("teams", [])).lower()
-                        if ta_key in teams and tb_key in teams:
+                        ta_p, tb_p, ta_f, tb_f = _team_keys(team_a, team_b)
+                        if ta_p in teams and tb_p in teams:
                             scores = m.get("score", [])
                             status = (m.get("status", "") or "").lower()
                             matchStarted = m.get("matchStarted", False)
@@ -542,8 +568,9 @@ def _try_cricbuzz(team_a: str, team_b: str) -> ScoreResult:
             content = r.text
 
             # Check if our match is mentioned at all
-            match_mentioned = (ta_key in content.lower() and
-                               tb_key in content.lower())
+            ta_p, tb_p, ta_f, tb_f = _team_keys(team_a, team_b)
+            match_mentioned = (ta_p in content.lower() and
+                               tb_p in content.lower())
 
             if not match_mentioned:
                 continue
@@ -558,7 +585,7 @@ def _try_cricbuzz(team_a: str, team_b: str) -> ScoreResult:
                         return None
                     if isinstance(obj, dict):
                         teams_str = str(obj).lower()
-                        if ta_key in teams_str and tb_key in teams_str:
+                        if ta_p in teams_str and tb_p in teams_str:
                             # Check match state
                             state = (obj.get("state","") or
                                      obj.get("status","") or
