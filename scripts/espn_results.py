@@ -262,6 +262,57 @@ def _try_cricketdata(team_a, team_b, match_date, api_key="TESTKEY0273"):
         pass
     return None
 
+# ── Source 5: cricketdata.org /v1/matches (completed) ────────
+def _try_cricketdata_completed(team_a, team_b, match_date, api_key):
+    """
+    cricketdata.org /v1/matches returns recent + completed matches.
+    Different from /v1/currentMatches which is live only.
+    """
+    ta_k = _team_key(team_a)
+    tb_k = _team_key(team_b)
+    try:
+        for offset in [0, 5, 10, 15]:
+            r = requests.get(
+                f"https://api.cricapi.com/v1/matches"
+                f"?apikey={api_key}&offset={offset}",
+                headers=HEADERS, timeout=6
+            )
+            if r.status_code != 200:
+                break
+            data = r.json()
+            if data.get("status") != "success":
+                break
+            matches = data.get("data", []) or []
+            if not matches:
+                break
+            for m in matches:
+                teams = " ".join(m.get("teams", [])).lower()
+                if ta_k not in teams or tb_k not in teams:
+                    continue
+                m_date = (m.get("date") or "")[:10]
+                if m_date and m_date != match_date:
+                    continue
+                status = (m.get("status") or "").strip()
+                scores = m.get("score") or []
+                matchEnded = m.get("matchEnded", False)
+                if not matchEnded and "won" not in status.lower():
+                    continue
+                winner = _parse_result_str(status, team_a, team_b)
+                sa = f"{scores[0].get('r',0)}/{scores[0].get('w',0)} ({scores[0].get('o',0)} ov)" if scores else ""
+                sb = f"{scores[1].get('r',0)}/{scores[1].get('w',0)} ({scores[1].get('o',0)} ov)" if len(scores)>1 else ""
+                if winner or "won" in status.lower():
+                    return ResultData(
+                        success=True,
+                        team1=team_a, score1=sa,
+                        team2=team_b, score2=sb,
+                        winner=winner, result_str=status,
+                        source="cricketdata.org"
+                    )
+    except Exception:
+        pass
+    return None
+
+
 # ── Main entry point ──────────────────────────────────────────
 def fetch_match_result(team_a: str, team_b: str,
                        match_date: str,
@@ -271,6 +322,7 @@ def fetch_match_result(team_a: str, team_b: str,
     All free — no Anthropic credits needed.
     """
     for fn in [
+        lambda: _try_cricketdata_completed(team_a, team_b, match_date, api_key),
         lambda: _try_hsconsumer_results(team_a, team_b, match_date),
         lambda: _try_espn_html(team_a, team_b, match_date),
         lambda: _try_cricbuzz_results(team_a, team_b, match_date),
