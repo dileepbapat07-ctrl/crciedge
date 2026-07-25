@@ -963,35 +963,50 @@ elif page == "🔴 Match dashboard":
                 height=80, key=f"{sk}_xp"
             )
 
-        fc1,fc2 = st.columns(2)
-        with fc1:
-            if st.button("🌐 Auto-fetch XI", key=f"{sk}_fxi"):
-                with st.spinner("Fetching from ESPNcricinfo..."):
-                    try:
-                        sys.path.insert(0, os.path.join(ROOT,"scripts"))
-                        from fetch_playingxi import fetch_and_store_xi
-                        res = fetch_and_store_xi(mid, match["date"], ta, tb)
-                        if res["success"]:
-                            S["xi"] = res.get("players",{})
-                            st.success(f"✅ {res['count']} players fetched")
-                            for team,players in res.get("players",{}).items():
-                                st.write(f"**{team}:** {', '.join(players)}")
-                        else:
-                            st.warning("Auto-fetch failed — paste XI above")
-                    except Exception as e:
-                        st.error(f"{e}")
+        if st.button("✅ Confirm toss & fetch XI → Run signal",
+                     type="primary", key=f"{sk}_conf"):
 
-        with fc2:
-            if st.button("✅ Confirm & run player signal",
-                         type="primary", key=f"{sk}_conf"):
-                # Parse pasted XI
-                if xi_paste and len(xi_paste)>10:
+            sys.path.insert(0, os.path.join(ROOT,"scripts"))
+            from fetch_playingxi import fetch_and_store_xi
+
+            with st.spinner("Fetching XI and computing signal..."):
+                # Fetch XI — try paste text first, then ESPNcricinfo
+                res = fetch_and_store_xi(
+                    mid, match["date"], ta, tb,
+                    xi_text=xi_paste if xi_paste and len(xi_paste)>10 else ""
+                )
+
+                # Show fetch log
+                matched = [l for l in res.get("log",[]) if l.startswith("✅")]
+                unmatched = [l for l in res.get("log",[]) if l.startswith("⚠")]
+                if res["success"]:
+                    st.success(
+                        f"✅ {res['count']} players loaded "
+                        f"({len(matched)} matched to DB, {len(unmatched)} name-only)"
+                    )
+                    S["xi"] = res.get("players",{})
+                    # Show log in expander
+                    with st.expander("🔍 Player mapping log"):
+                        for line in res.get("log",[]):
+                            st.text(line)
+                    # Pre-fill toss from scraped data
+                    if res.get("toss_winner") and not toss_winner:
+                        st.info(f"🪙 Toss: **{res['toss_winner']}** elected to **{res['toss_choice']}**")
+                else:
+                    st.warning(
+                        "Could not fetch XI automatically. "
+                        "Paste XI text above and try again."
+                    )
+                    for line in res.get("log",[]):
+                        st.text(line)
+
+
+                # Step 2: If pasted text provided, override/supplement
+                if xi_paste and len(xi_paste) > 10:
                     try:
-                        sys.path.insert(0, os.path.join(ROOT,"scripts"))
-                        from fetch_playingxi import fetch_and_store_xi
-                        res = fetch_and_store_xi(mid, match["date"], ta, tb, xi_text=xi_paste)
-                        if res["success"]:
-                            S["xi"] = res.get("players",{})
+                        res2 = fetch_and_store_xi(mid, match["date"], ta, tb, xi_text=xi_paste)
+                        if res2["success"]:
+                            S["xi"] = res2.get("players",{})
                     except Exception:
                         pass
 
@@ -1002,7 +1017,7 @@ elif page == "🔴 Match dashboard":
                     try:
                         sys.path.insert(0, os.path.join(ROOT,"player_engine"))
                         from player_signal import get_player_signal
-                        sig = get_player_signal(mid, ta, tb, fmt, match["venue_id"], gender)
+                        sig = get_player_signal(mid, ta, tb, "T20" if fmt in ("100b","T20I") else fmt, match["venue_id"], gender)
                         S["signal"] = sig
                         st.success(f"✅ Player signal computed — "
                                    f"{ta} {sig.team_a_signal.overall:.1f}/10 vs "
@@ -1245,7 +1260,7 @@ elif page == "🔴 Match dashboard":
                                                  score_d.get("score",0),1,key=f"{sk}_sc")
                     wickets    = st.number_input("Wickets",0,9,
                                                  score_d.get("wickets",0),1,key=f"{sk}_wk")
-                    balls_done = st.number_input(f"Balls (of {total_balls})",
+                    balls_done = st.number_input(f"Balls ({total_balls//6} ov × 6 = {total_balls})",
                                                  0,total_balls,
                                                  score_d.get("balls_done",0),1,key=f"{sk}_bd")
 
@@ -1554,7 +1569,7 @@ elif page == "👁 In-play engine":
                                      0, 600, fetched.get("score", 51), 1, key="ip_score")
         wickets    = st.number_input("Wickets lost",
                                      0, 9, fetched.get("wickets", 3), 1, key="ip_wkts")
-        balls_done = st.number_input(f"Balls completed (of {total_balls})",
+        balls_done = st.number_input(f"Balls completed ({total_balls//6} ov × 6 = {total_balls})",
                                      0, total_balls, fetched.get("balls_done", 44), 1, key="ip_balls")
 
     with c3:
@@ -1749,11 +1764,13 @@ elif page == "👤 Player analytics":
                 try:
                     from player_signal import get_player_signal
                     with st.spinner("Computing player signal..."):
+                        # Map 100b → T20 for player form lookup (same player pool)
+                        ps_fmt = "T20" if sm_ps["format"] in ("100b","T20I") else sm_ps["format"]
                         sig = get_player_signal(
                             match_id = sm_ps["match_id"],
                             team_a   = sm_ps["team_a"],
                             team_b   = sm_ps["team_b"],
-                            fmt      = sm_ps["format"],
+                            fmt      = ps_fmt,
                             venue_id = sm_ps["venue_id"],
                         )
 
