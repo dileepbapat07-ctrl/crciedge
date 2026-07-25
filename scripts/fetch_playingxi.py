@@ -1,297 +1,396 @@
 """
-scripts/fetch_playing_xi.py
-============================
+scripts/fetch_playingxi.py
+===========================
 Fetches confirmed playing XI from ESPNcricinfo after toss.
-Called from Streamlit UI — no terminal needed.
+Maps scraped names to our central player database using fuzzy matching + aliases.
 
-4 strategies in order:
-  1. ESPNcricinfo JSON embedded in page
-  2. ESPNcricinfo HTML scrape
-  3. Google search for XI text
-  4. Parse from manually pasted text
+Called from "Confirm toss & XI" button in Match Dashboard.
+No separate auto-fetch button needed.
+
+Flow:
+  1. Scrape ESPNcricinfo match page for confirmed XI names
+  2. Fuzzy-match each name to players in our DB (using name + aliases)
+  3. Write matched players to playing_xi table
+  4. Unmatched players written as name-only entries
+
+Matching priority:
+  exact match on name → alias match → fuzzy match (≥0.72 similarity)
 """
 
-import sqlite3, os, sys, re, time, json
-from datetime import datetime
+import sqlite3, os, re, json
 from difflib import SequenceMatcher
+from typing import Optional
 
 try:
     import requests
-    from bs4 import BeautifulSoup
+    HAS_REQUESTS = True
 except ImportError:
-    raise ImportError("pip install requests beautifulsoup4")
+    HAS_REQUESTS = False
 
-ROOT       = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CRICKET_DB = os.path.join(ROOT, "db", "cricket_engine.db")
-PLAYER_DB  = os.path.join(ROOT, "db", "player_engine.db")
+ROOT      = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+MAIN_DB   = os.path.join(ROOT, "db", "cricket_engine.db")
+PLAYER_DB = os.path.join(ROOT, "db", "player_engine.db")
 
 HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,*/*;q=0.9",
-    "Accept-Language": "en-US,en;q=0.5",
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                   "Chrome/124.0.0.0 Safari/537.36"),
+    "Accept": "application/json, text/html, */*",
 }
 
-KNOWN_TEAMS = [
-    "India","England","Australia","Pakistan","West Indies",
-    "New Zealand","South Africa","Sri Lanka","Bangladesh",
-    "Afghanistan","Zimbabwe","Ireland",
-]
+# ── Name normalisation ────────────────────────────────────────
+def norm(name: str) -> str:
+    """Lowercase, strip captain/keeper markers, strip excess whitespace."""
+    n = name.lower()
+    n = re.sub(r'\s*[†\*\(c\)\(wk\)]+', '', n)
+    n = re.sub(r'\s+', ' ', n).strip()
+    return n
 
-# ── Fuzzy name match ──────────────────────────────────────────
-def fuzzy_match(scraped: str, known_players: list) -> dict | None:
-    clean = re.sub(r'\([cwk]+\)|†|\*', '', scraped, flags=re.I).strip().lower()
-    best_score, best = 0, None
-    for p in known_players:
-        for cand in [p.get("name",""), p.get("short_name",""),
-                     (p.get("name","") or "").split()[-1]]:
-            if not cand: continue
-            s = SequenceMatcher(None, clean, cand.lower()).ratio()
-            if clean == cand.lower().split()[-1]: s = max(s, 0.88)
-            if s > best_score:
-                best_score, best = s, p
-    return best if best_score >= 0.72 else None
+def similarity(a: str, b: str) -> float:
+    return SequenceMatcher(None, norm(a), norm(b)).ratio()
 
-# ── Strategy 1: ESPNcricinfo direct scrape ────────────────────
-def scrape_espncricinfo(team_a: str, team_b: str, match_date: str) -> dict | None:
-    """Search Google for the ESPNcricinfo XI page then scrape it."""
-    date_obj = datetime.strptime(match_date, "%Y-%m-%d")
-    q = f"{team_a} vs {team_b} playing XI {date_obj.strftime('%B %Y')} espncricinfo"
-    search_url = f"https://www.google.com/search?q={requests.utils.quote(q)}&num=5"
+def last_name(name: str) -> str:
+    parts = norm(name).split()
+    return parts[-1] if parts else ""
 
-    try:
-        r = requests.get(search_url, headers=HEADERS, timeout=10)
-        # Find espncricinfo match URLs
-        urls = re.findall(
-            r'https://www\.espncricinfo\.com/series/[^\s"&>]+',
-            r.text
-        )
-        match_urls = [u for u in urls if any(
-            x in u for x in ["playing-xi","scorecard","full-scorecard"]
-        )]
-        if not match_urls and urls:
-            # Build XI URL from any match URL
-            base = re.sub(r'/[^/]+-\d+$', '', urls[0])
-            match_urls = [base + "/match-playing-xi"]
-    except Exception as e:
-        return None
-
-    for url in match_urls[:2]:
-        if "playing-xi" not in url:
-            url = re.sub(r'/[^/]+$', '/match-playing-xi', url)
-        try:
-            r = requests.get(url, headers=HEADERS, timeout=12)
-            if r.status_code != 200:
-                continue
-            soup = BeautifulSoup(r.text, "html.parser")
-            result = _parse_cricinfo_page(soup)
-            if result and result.get("players"):
-                return result
-        except Exception:
-            continue
-        time.sleep(1)
-
-    return None
-
-def _parse_cricinfo_page(soup) -> dict:
-    """Try multiple parse strategies on the ESPNcricinfo page."""
-    result = {"players": {}, "captains": {}, "keepers": {}, "toss_winner": None, "toss_choice": None}
-
-    # Strategy A: Embedded JSON state
-    for script in soup.find_all("script"):
-        text = script.string or ""
-        for pattern in [
-            r'"playingXI"\s*:\s*(\[.*?\])',
-            r'"players"\s*:\s*(\[.*?\])',
-            r'"squad"\s*:\s*(\[.*?\])',
-        ]:
-            m = re.search(pattern, text, re.DOTALL)
-            if m:
-                try:
-                    players = json.loads(m.group(1))
-                    for p in players:
-                        if isinstance(p, dict):
-                            name = p.get("name") or p.get("fullName","")
-                            team = p.get("teamName") or p.get("team","")
-                            if name and team:
-                                result["players"].setdefault(team, []).append(name)
-                except Exception:
-                    pass
-        if result["players"]:
-            break
-
-    # Strategy B: HTML player cards
-    if not result["players"]:
-        page_text = soup.get_text(" ", strip=True)
-        result = _parse_xi_text(page_text)
-
-    # Toss
-    toss_text = soup.get_text()
-    tm = re.search(
-        r"([\w\s]+?)\s+won the toss\s+and\s+(?:elected|chose)\s+to\s+(bat|field)",
-        toss_text, re.I
-    )
-    if tm:
-        result["toss_winner"] = tm.group(1).strip()
-        result["toss_choice"] = tm.group(2).strip()
-
-    return result
-
-# ── Strategy 2: Parse from any text ──────────────────────────
-def _parse_xi_text(text: str) -> dict:
+# ── Player DB lookup ─────────────────────────────────────────
+def load_players(team: str) -> list[dict]:
     """
-    Parse XI from raw text. Handles formats:
-      "India: Rohit Sharma, Shubman Gill(c), KL Rahul(wk)..."
-      "India Playing XI: 1.Rohit 2.Gill..."
-      "India XI - Rohit Sharma, Gill, Kohli..."
+    Load ALL players from DB for name matching.
+    team param used only for ranking — players are format/team agnostic.
+    One record per player regardless of what competition they play in.
     """
-    result = {"players": {}, "captains": {}, "keepers": {}}
-
-    for team in KNOWN_TEAMS:
-        patterns = [
-            # "India: Name, Name, ..."
-            rf"{re.escape(team)}\s*(?:Playing\s*XI|XI|squad)?[:\-–]\s*"
-            rf"([A-Z][a-zA-Z\s\(\)†]+(?:,\s*[A-Z][a-zA-Z\s\(\)†]+){{6,11}})",
-            # "India (Playing XI): ..."
-            rf"{re.escape(team)}\s*\([^)]*\)[:\s]*"
-            rf"([A-Z][a-zA-Z\s\(\)†]+(?:,\s*[A-Z][a-zA-Z\s\(\)†]+){{6,11}})",
-        ]
-
-        for pattern in patterns:
-            m = re.search(pattern, text, re.IGNORECASE)
-            if not m:
-                continue
-
-            raw = m.group(1)
-            names = []
-            for part in re.split(r',|\d+[\.\)]', raw):
-                part = part.strip()
-                if not part or len(part) < 4:
-                    continue
-                is_cap = bool(re.search(r'\(c\)', part, re.I))
-                is_wk  = bool(re.search(r'\(wk\)|\(w\)|†', part, re.I))
-                clean  = re.sub(r'\([cwk]+\)|†|\*', '', part, flags=re.I).strip()
-                if len(clean) > 3 and re.match(r'^[A-Z]', clean):
-                    names.append(clean)
-                    if is_cap: result["captains"][team] = clean
-                    if is_wk:  result["keepers"][team]  = clean
-
-            if len(names) >= 8:
-                result["players"][team] = names[:11]
-                break
-
-    return result
-
-# ── Write XI to DB ────────────────────────────────────────────
-def write_xi(match_id: str, match_date: str, xi_data: dict,
-             dry_run: bool = False) -> tuple[int, list]:
-    """
-    Writes XI to playing_xi table.
-    Returns (count_inserted, log_lines)
-    """
-    log = []
-    if not xi_data.get("players"):
-        return 0, ["No player data parsed"]
-
     pconn = sqlite3.connect(PLAYER_DB)
     pconn.row_factory = sqlite3.Row
-    known = [dict(p) for p in pconn.execute(
-        "SELECT player_id, name, short_name, team FROM players"
-    ).fetchall()]
 
-    count = 0
-    for team, names in xi_data["players"].items():
-        log.append(f"**{team}** ({len(names)} players)")
-        for raw in names:
-            clean = re.sub(r'\([cwk]+\)|†|\*', '', raw, flags=re.I).strip()
-            if len(clean) < 3: continue
+    rows = pconn.execute("""
+        SELECT player_id, name, short_name, team, nationality,
+               current_franchise, role, batting_position,
+               is_key_player, name_aliases,
+               t20_avg, t20_sr, t20_runs, t20_matches
+        FROM players
+        ORDER BY
+            -- Prioritise: same franchise > same nationality > anyone
+            CASE WHEN current_franchise=? THEN 0
+                 WHEN nationality=? OR team=? THEN 1
+                 ELSE 2 END,
+            is_key_player DESC,
+            COALESCE(t20_matches,0) DESC
+    """, (team, team, team)).fetchall()
 
-            is_cap = clean == xi_data.get("captains",{}).get(team,"")
-            is_wk  = clean == xi_data.get("keepers", {}).get(team,"")
-
-            matched = fuzzy_match(clean, known)
-            if matched:
-                pid, pname = matched["player_id"], matched["name"]
-                log.append(f"  ✅ {clean} → {pname}")
-            else:
-                pid   = f"unk-{re.sub(r'[^a-z]','',clean.lower())[:12]}-{team[:3].lower()}"
-                pname = clean
-                log.append(f"  🆕 {clean} (new player added)")
-                if not dry_run:
-                    pconn.execute("""
-                        INSERT OR IGNORE INTO players
-                        (player_id, name, short_name, team, gender)
-                        VALUES (?,?,?,?,'male')
-                    """, (pid, clean, clean.split()[-1], team))
-
-            if not dry_run:
-                pconn.execute("""
-                    INSERT OR REPLACE INTO playing_xi
-                    (match_id, match_date, team, player_id, player_name,
-                     is_available, is_captain, is_keeper, source, entered_at)
-                    VALUES (?,?,?,?,?,1,?,?,'auto-scraped',datetime('now'))
-                """, (match_id, match_date, team, pid, pname,
-                      1 if is_cap else 0, 1 if is_wk else 0))
-                count += 1
-
-    if not dry_run:
-        pconn.commit()
     pconn.close()
-    return count, log
+    players = []
+    for r in rows:
+        p = dict(r)
+        candidates = [p["name"], p["short_name"] or ""]
+        if p["name_aliases"]:
+            candidates += [a.strip() for a in p["name_aliases"].split(",")]
+        p["_candidates"] = [c for c in candidates if c]
+        players.append(p)
+    return players
 
-# ── Main entry point called from Streamlit ────────────────────
+def match_player(scraped_name: str, players: list[dict]) -> Optional[dict]:
+    """
+    Match a scraped name to a player in our DB.
+    Returns the best match or None if below threshold.
+    """
+    sn = norm(scraped_name)
+    sl = last_name(scraped_name)
+
+    best_score = 0.0
+    best_player = None
+
+    for p in players:
+        for cand in p["_candidates"]:
+            if not cand:
+                continue
+            # Exact match (after normalisation)
+            if norm(cand) == sn:
+                return p
+            # Last name exact match — high confidence
+            if last_name(cand) == sl and sl:
+                score = 0.90
+            else:
+                score = similarity(scraped_name, cand)
+
+            if score > best_score:
+                best_score = score
+                best_player = p
+
+    if best_score >= 0.72:
+        return best_player
+    return None
+
+# ── Scrape ESPNcricinfo ───────────────────────────────────────
+def _scrape_espn_xi(team_a: str, team_b: str, match_date: str) -> dict:
+    """
+    Scrape ESPNcricinfo for confirmed playing XI.
+    Returns {"team_a_xi": [...names...], "team_b_xi": [...names...],
+             "toss_winner": "...", "toss_choice": "bat/field"}
+    """
+    if not HAS_REQUESTS:
+        return {}
+
+    result = {}
+
+    try:
+        # Search for the match
+        query = f"{team_a} vs {team_b} playing xi {match_date} site:espncricinfo.com"
+        r = requests.get(
+            "https://hs-consumer-api.espncricinfo.com/v1/pages/matches/live"
+            "?lang=en&limit=50",
+            headers=HEADERS, timeout=6
+        )
+        if r.status_code != 200:
+            raise Exception(f"ESPN HTTP {r.status_code}")
+
+        data = r.json()
+        ta_k = team_a.lower().replace(" women","").split()[-1]
+        tb_k = team_b.lower().replace(" women","").split()[-1]
+
+        matches = data.get("content",{}).get("matches",[]) or []
+        match_obj = None
+        for m in matches:
+            t1 = m.get("team1",{}).get("name","").lower()
+            t2 = m.get("team2",{}).get("name","").lower()
+            if ta_k in t1+t2 and tb_k in t1+t2:
+                match_obj = m
+                break
+
+        if not match_obj:
+            return {}
+
+        # Get match ID and fetch scorecard
+        mid = match_obj.get("objectId") or match_obj.get("id")
+        if not mid:
+            return {}
+
+        sc = requests.get(
+            f"https://hs-consumer-api.espncricinfo.com/v1/pages/match/playing-xi"
+            f"?lang=en&matchId={mid}",
+            headers=HEADERS, timeout=6
+        )
+        if sc.status_code == 200:
+            scdata = sc.json()
+            for team_key in ["team1","team2"]:
+                t = scdata.get(team_key, {})
+                tname = t.get("name","")
+                xi = [p.get("name","") for p in t.get("playingXI",[]) if p.get("name")]
+                if xi:
+                    if ta_k in tname.lower():
+                        result["team_a_xi"] = xi
+                    else:
+                        result["team_b_xi"] = xi
+
+        # Toss info
+        toss = match_obj.get("toss",{})
+        if toss:
+            result["toss_winner"] = toss.get("winnerTeamName","")
+            result["toss_choice"] = toss.get("decision","").lower()  # "bat" or "field"
+
+    except Exception as e:
+        result["_error"] = str(e)
+
+    return result
+
+def _parse_xi_text(text: str, team_a: str, team_b: str) -> dict:
+    """
+    Parse playing XI from pasted text.
+    Handles formats like:
+      "India: Rohit, Gill, Kohli, ..."
+      "1. Rohit Sharma 2. Shubman Gill ..."
+      Player names separated by commas or newlines
+    """
+    result = {}
+    lines = text.strip().split("\n")
+
+    current_team = None
+    xi_a, xi_b = [], []
+
+    ta_k = team_a.lower().replace(" women","").split()[-1]
+    tb_k = team_b.lower().replace(" women","").split()[-1]
+
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        # Detect team header: "India:" or "India Playing XI:"
+        if ":" in line and len(line.split(":")[0]) < 40:
+            header = line.split(":")[0].lower()
+            names_part = line.split(":",1)[1]
+            if ta_k in header:
+                current_team = "a"
+                names = re.split(r'[,\n]+', names_part)
+                xi_a += [n.strip() for n in names if len(n.strip()) > 2]
+            elif tb_k in header:
+                current_team = "b"
+                names = re.split(r'[,\n]+', names_part)
+                xi_b += [n.strip() for n in names if len(n.strip()) > 2]
+            continue
+
+        # Numbered list: "1. Rohit Sharma"
+        m = re.match(r'^(\d+)[.)]\s*(.+)$', line)
+        if m:
+            name = m.group(2).strip()
+            if current_team == "a": xi_a.append(name)
+            elif current_team == "b": xi_b.append(name)
+            continue
+
+        # Plain name lines
+        if current_team == "a" and len(line) > 2:
+            xi_a.append(line)
+        elif current_team == "b" and len(line) > 2:
+            xi_b.append(line)
+
+    # Toss
+    toss_m = re.search(
+        r'([\w\s]+?)\s+won\s+the\s+toss\s+and\s+elected\s+to\s+(bat|field)',
+        text, re.IGNORECASE
+    )
+    if toss_m:
+        result["toss_winner"] = toss_m.group(1).strip()
+        result["toss_choice"] = toss_m.group(2).strip().lower()
+
+    if xi_a: result["team_a_xi"] = xi_a
+    if xi_b: result["team_b_xi"] = xi_b
+    return result
+
+# ── Write to playing_xi table ─────────────────────────────────
+def _write_xi(match_id: str, match_date: str,
+              team: str, names: list[str], players_db: list[dict]) -> tuple[int, list]:
+    """Match names to DB players and write to playing_xi."""
+    pconn = sqlite3.connect(PLAYER_DB)
+    log = []
+    written = 0
+
+    # Clear existing XI for this match+team
+    pconn.execute(
+        "DELETE FROM playing_xi WHERE match_id=? AND team=?",
+        (match_id, team)
+    )
+
+    for i, name in enumerate(names):
+        name = name.strip()
+        if not name or len(name) < 2:
+            continue
+
+        player = match_player(name, players_db)
+
+        # Detect captain/keeper from markers
+        is_cap = bool(re.search(r'\(c\)|\*', name, re.IGNORECASE))
+        is_wk  = bool(re.search(r'\(wk\)|†', name, re.IGNORECASE))
+
+        if player:
+            pid = player["player_id"]
+            bat_pos = player.get("batting_position") or (i+1)
+            log.append(f"✅ {name} → {player['name']} ({pid})")
+        else:
+            pid = None
+            bat_pos = i + 1
+            log.append(f"⚠ {name} → no match in DB (written as name-only)")
+
+        pconn.execute("""
+            INSERT OR REPLACE INTO playing_xi
+            (match_id, match_date, team, player_id, player_name,
+             batting_position, is_available, is_captain, is_keeper,
+             source, entered_at)
+            VALUES (?,?,?,?,?,?,1,?,?,?,datetime('now'))
+        """, (match_id, match_date, team, pid, name,
+              bat_pos, 1 if is_cap else 0, 1 if is_wk else 0,
+              "auto_fetch"))
+        written += 1
+
+    pconn.commit()
+    pconn.close()
+    return written, log
+
+# ── Main entry point ──────────────────────────────────────────
 def fetch_and_store_xi(
     match_id:   str,
     match_date: str,
     team_a:     str,
     team_b:     str,
-    xi_text:    str = None,   # manually pasted text
-    dry_run:    bool = False,
+    xi_text:    str = "",
 ) -> dict:
     """
-    Returns:
-    {
-      "success": True/False,
-      "method": "scraped"/"text"/"failed",
-      "toss_winner": "England",
-      "toss_choice": "bat",
-      "players": {"India": [...], "England": [...]},
-      "count": 22,
-      "log": ["line1", "line2", ...],
-    }
+    Single entry point. Called from "Confirm toss & XI" button.
+
+    1. If xi_text provided → parse it
+    2. Else → scrape ESPNcricinfo
+    3. Map names to player DB
+    4. Write to playing_xi table
     """
     log = []
+    result = {"success": False, "count": 0, "players": {},
+              "toss_winner": "", "toss_choice": "", "log": log}
 
-    # Method A: parse pasted text (fastest, most reliable)
-    if xi_text and len(xi_text) > 20:
-        log.append("Parsing from pasted text...")
-        xi_data = _parse_xi_text(xi_text)
-        if xi_data.get("players"):
-            count, write_log = write_xi(match_id, match_date, xi_data, dry_run)
-            return {
-                "success": True, "method": "text",
-                "toss_winner": xi_data.get("toss_winner"),
-                "toss_choice": xi_data.get("toss_choice"),
-                "players": xi_data["players"],
-                "count": count, "log": log + write_log,
-            }
-        log.append("⚠ Could not parse XI from text — trying web scrape...")
+    # Get XI names
+    xi_data = {}
+    if xi_text and len(xi_text.strip()) > 10:
+        log.append("📋 Parsing pasted XI text...")
+        xi_data = _parse_xi_text(xi_text, team_a, team_b)
+        if xi_data.get("team_a_xi") or xi_data.get("team_b_xi"):
+            log.append(f"✅ Parsed from text: {len(xi_data.get('team_a_xi',[]))} + {len(xi_data.get('team_b_xi',[]))} players")
+        else:
+            log.append("⚠ Could not parse text — trying web scrape")
+            xi_text = ""  # fall through to scrape
 
-    # Method B: scrape ESPNcricinfo
-    log.append(f"Searching ESPNcricinfo for {team_a} vs {team_b}...")
-    xi_data = scrape_espncricinfo(team_a, team_b, match_date)
-    if xi_data and xi_data.get("players"):
-        count, write_log = write_xi(match_id, match_date, xi_data, dry_run)
-        return {
-            "success": True, "method": "scraped",
-            "toss_winner": xi_data.get("toss_winner"),
-            "toss_choice": xi_data.get("toss_choice"),
-            "players": xi_data["players"],
-            "count": count, "log": log + write_log,
-        }
+    if not xi_data.get("team_a_xi") and not xi_data.get("team_b_xi"):
+        log.append(f"🌐 Fetching XI from ESPNcricinfo: {team_a} vs {team_b}...")
+        xi_data = _scrape_espn_xi(team_a, team_b, match_date)
+        if xi_data.get("_error"):
+            log.append(f"⚠ Scrape error: {xi_data['_error']}")
+        if xi_data.get("team_a_xi"):
+            log.append(f"✅ Fetched {len(xi_data['team_a_xi'])} players for {team_a}")
+        if xi_data.get("team_b_xi"):
+            log.append(f"✅ Fetched {len(xi_data['team_b_xi'])} players for {team_b}")
 
-    log.append("⚠ Auto-fetch failed. Please paste the XI text below.")
-    return {"success": False, "method": "failed", "log": log, "count": 0, "players": {}}
+    if not xi_data.get("team_a_xi") and not xi_data.get("team_b_xi"):
+        log.append("❌ No XI found — paste XI text in the box above")
+        return result
+
+    result["toss_winner"] = xi_data.get("toss_winner", "")
+    result["toss_choice"] = xi_data.get("toss_choice", "")
+
+    total = 0
+    all_players = {}
+
+    # Match and write team A
+    if xi_data.get("team_a_xi"):
+        players_a = load_players(team_a)
+        n, write_log = _write_xi(match_id, match_date, team_a,
+                                  xi_data["team_a_xi"], players_a)
+        log += write_log
+        total += n
+        all_players[team_a] = xi_data["team_a_xi"]
+
+    # Match and write team B
+    if xi_data.get("team_b_xi"):
+        players_b = load_players(team_b)
+        n, write_log = _write_xi(match_id, match_date, team_b,
+                                  xi_data["team_b_xi"], players_b)
+        log += write_log
+        total += n
+        all_players[team_b] = xi_data["team_b_xi"]
+
+    result["success"] = total > 0
+    result["count"]   = total
+    result["players"] = all_players
+    result["method"]  = "text" if xi_text else "scraped"
+
+    return result
+
+
+if __name__ == "__main__":
+    # Test
+    r = fetch_and_store_xi(
+        match_id   = "20260714-IND-ENG-ODI-1STODIM",
+        match_date = "2026-07-14",
+        team_a     = "India",
+        team_b     = "England",
+        xi_text    = """India: Rohit Sharma (c), Shubman Gill, Virat Kohli, Shreyas Iyer, KL Rahul (wk), Washington Sundar, Shivam Dube, Axar Patel, Gurnoor Brar, Jasprit Bumrah, Prasidh Krishna
+England: Ben Duckett, Phil Salt (wk), Joe Root, Harry Brook (c), Liam Livingstone, Jamie Smith, Chris Woakes, Brydon Carse, Rehan Ahmed, Jofra Archer, Mark Wood"""
+    )
+    print(f"\nResult: success={r['success']} count={r['count']}")
+    for line in r["log"]:
+        print(f"  {line}")
