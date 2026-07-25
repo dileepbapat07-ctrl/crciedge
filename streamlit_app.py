@@ -1570,7 +1570,9 @@ elif page == "👁 In-play engine":
         wickets    = st.number_input("Wickets lost",
                                      0, 9, fetched.get("wickets", 3), 1, key="ip_wkts")
         balls_done = st.number_input(f"Balls completed ({total_balls//6} ov × 6 = {total_balls})",
-                                     0, total_balls, fetched.get("balls_done", 44), 1, key="ip_balls")
+                                     0, total_balls,
+                                     min(fetched.get("balls_done", 0), total_balls),
+                                     1, key="ip_balls")
 
     with c3:
         target = None
