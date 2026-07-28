@@ -147,6 +147,7 @@ with st.sidebar:
         "🔴 Match dashboard",
         "👁 In-play engine",
         "👤 Player analytics",
+        "📅 Calendar & Targets",
         "📈 Bankroll tracker",
         "🧬 ELO ratings",
         "🛡 Risk framework",
@@ -2162,6 +2163,148 @@ elif page == "👤 Player analytics":
 # ══════════════════════════════════════════════════════════════════════════
 # PAGE: BANKROLL TRACKER
 # ══════════════════════════════════════════════════════════════════════════
+
+elif page == "📅 Calendar & Targets":
+    import math
+    from datetime import date, timedelta
+
+    st.title("📅 Calendar & Targets")
+    st.markdown("Daily compound target at **1.007× per match day** from **€10,000** base · Jul 28 2026")
+    st.divider()
+
+    # ── Constants ─────────────────────────────────────────────
+    BASE        = 10_000.0
+    RATE        = 1.007
+    EPOCH       = date(2026, 7, 28)   # day 0
+    TODAY       = date.today()
+    DAY_N       = (TODAY - EPOCH).days
+    TODAY_TGT   = BASE * (RATE ** DAY_N)
+
+    # ── Today headline ────────────────────────────────────────
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Today's target",  f"€{TODAY_TGT:,.0f}")
+    c2.metric("Day number",      f"Day {DAY_N}")
+    c3.metric("Rate per day",    "+0.7%")
+    c4.metric("Base capital",    "€10,000")
+
+    st.divider()
+
+    # ── Load matches from DB ──────────────────────────────────
+    conn_cal = sqlite3.connect(DB_PATH)
+    conn_cal.row_factory = sqlite3.Row
+
+    # Get all matches from today onwards, group by date
+    matches_raw = conn_cal.execute("""
+        SELECT date, team_a, team_b, format, gender, series, category
+        FROM matches
+        WHERE date >= ?
+        ORDER BY date, format, gender
+    """, (TODAY.isoformat(),)).fetchall()
+    conn_cal.close()
+
+    # Group by date
+    from collections import defaultdict
+    by_date = defaultdict(list)
+    for m in matches_raw:
+        by_date[m["date"]].append(m)
+
+    # ── Build calendar ────────────────────────────────────────
+    # Show 90 days from today
+    SHOW_DAYS = 90
+
+    st.markdown(f"#### Match calendar · {TODAY.strftime('%d %b %Y')} → {(TODAY + timedelta(days=SHOW_DAYS)).strftime('%d %b %Y')}")
+
+    # Filter controls
+    cal_col1, cal_col2, cal_col3 = st.columns(3)
+    with cal_col1:
+        show_gender = st.selectbox("Gender", ["All", "Men", "Women"], key="cal_gender")
+    with cal_col2:
+        show_format = st.selectbox("Format", ["All", "Test", "ODI", "T20I", "100b", "T20"], key="cal_format")
+    with cal_col3:
+        show_type = st.selectbox("Type", ["All", "International", "Domestic"], key="cal_type")
+
+    # ── Day by day table ──────────────────────────────────────
+    prev_month = ""
+    day_count = 0
+    total_matches = 0
+
+    for delta in range(SHOW_DAYS + 1):
+        d = TODAY + timedelta(days=delta)
+        ds = d.isoformat()
+        day_n = (d - EPOCH).days
+        target = BASE * (RATE ** day_n)
+
+        matches_today = by_date.get(ds, [])
+
+        # Apply filters
+        filtered = []
+        for m in matches_today:
+            if show_gender == "Men"   and m["gender"] != "male":   continue
+            if show_gender == "Women" and m["gender"] != "female": continue
+            if show_format != "All"   and m["format"] != show_format: continue
+            if show_type == "International" and m["category"] not in ("International","intl"): continue
+            if show_type == "Domestic"      and m["category"] in ("International","intl"):     continue
+            filtered.append(m)
+
+        if not filtered and show_format != "All":
+            continue  # skip empty days when filtered
+
+        # Month header
+        month_str = d.strftime("%B %Y")
+        if month_str != prev_month:
+            if prev_month:
+                st.markdown("---")
+            st.markdown(f"### {month_str}")
+            # Month summary columns
+            mc1, mc2 = st.columns(2)
+            month_start_n = (date(d.year, d.month, 1) - EPOCH).days
+            month_end_n   = month_start_n + 30
+            mc1.caption(f"Month target range: €{BASE*(RATE**month_start_n):,.0f} → €{BASE*(RATE**month_end_n):,.0f}")
+            mc2.caption(f"Growth this month: +{((RATE**30)-1)*100:.1f}%")
+            prev_month = month_str
+
+        # Day row
+        is_today = (d == TODAY)
+        is_weekend = d.weekday() >= 5
+
+        # Build match pills
+        match_strs = []
+        for m in filtered:
+            fmt_icon = {"Test":"🔴","ODI":"🟠","T20I":"🟢","T20":"🟢","100b":"🔵"}.get(m["format"],"⚪")
+            gender_tag = " (W)" if m["gender"] == "female" else ""
+            match_strs.append(f"{fmt_icon} {m['team_a']} vs {m['team_b']}{gender_tag}")
+
+        n_matches = len(filtered)
+        total_matches += n_matches
+
+        if is_today:
+            st.markdown(f"""
+<div style="border:2px solid #0ca30c;border-radius:8px;padding:10px 14px;margin:4px 0;background:#f0fdf4">
+<strong>TODAY — {d.strftime('%a %d %b')} · Day {day_n}</strong> &nbsp;|&nbsp;
+<span style="font-size:18px;font-weight:600;color:#0ca30c">Target: €{target:,.0f}</span>
+&nbsp;|&nbsp; <span style="color:#555">{n_matches} match{'es' if n_matches!=1 else ''}</span><br>
+<span style="font-size:13px;color:#333">{' &nbsp; '.join(match_strs) if match_strs else '<i>No matches in DB</i>'}</span>
+</div>""", unsafe_allow_html=True)
+        else:
+            day_bg = "#f8f8f7" if is_weekend else "transparent"
+            match_text = ' · '.join(match_strs[:6])
+            if len(match_strs) > 6:
+                match_text += f" +{len(match_strs)-6} more"
+            if not match_strs:
+                match_text = "*No matches*"
+
+            col_date, col_tgt, col_matches = st.columns([1.2, 1, 4.8])
+            col_date.markdown(f"**{d.strftime('%a %d %b')}**")
+            col_tgt.markdown(f"€{target:,.0f}")
+            col_matches.markdown(match_text)
+
+        day_count += 1
+
+    st.divider()
+    st.caption(f"Showing {day_count} days · {total_matches} match-days in window · "
+               f"Rate: 1.007× compounded daily from €10,000 base on Jul 28 2026")
+
+
 elif page == "📈 Bankroll tracker":
     st.title("📈 Bankroll tracker")
     st.markdown("Two-phase compound growth — **€5,000 → €124,040** across 193 bets")
