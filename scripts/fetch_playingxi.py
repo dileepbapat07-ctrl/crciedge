@@ -124,7 +124,10 @@ def match_player(scraped_name: str, players: list[dict]) -> Optional[dict]:
 # ── Scrape ESPNcricinfo ───────────────────────────────────────
 def _scrape_espn_xi(team_a: str, team_b: str, match_date: str) -> dict:
     """
-    Scrape ESPNcricinfo for confirmed playing XI.
+    Scrape ESPNcricinfo for confirmed playing XI + toss, using the
+    confirmed-working endpoint structure (espn_common.py — verified
+    against matryer/xbar-plugins live_cricket.2m.py).
+
     Returns {"team_a_xi": [...names...], "team_b_xi": [...names...],
              "toss_winner": "...", "toss_choice": "bat/field"}
     """
@@ -134,59 +137,41 @@ def _scrape_espn_xi(team_a: str, team_b: str, match_date: str) -> dict:
     result = {}
 
     try:
-        # Search for the match
-        query = f"{team_a} vs {team_b} playing xi {match_date} site:espncricinfo.com"
-        r = requests.get(
-            "https://hs-consumer-api.espncricinfo.com/v1/pages/matches/live"
-            "?lang=en&limit=50",
-            headers=HEADERS, timeout=6
-        )
-        if r.status_code != 200:
-            raise Exception(f"ESPN HTTP {r.status_code}")
+        import sys, os
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from espn_common import find_match, fetch_match_detail, get_match_teams, _sim
 
-        data = r.json()
-        ta_k = team_a.lower().replace(" women","").split()[-1]
-        tb_k = team_b.lower().replace(" women","").split()[-1]
-
-        matches = data.get("content",{}).get("matches",[]) or []
-        match_obj = None
-        for m in matches:
-            t1 = m.get("team1",{}).get("name","").lower()
-            t2 = m.get("team2",{}).get("name","").lower()
-            if ta_k in t1+t2 and tb_k in t1+t2:
-                match_obj = m
-                break
-
+        match_obj = find_match(team_a, team_b)
         if not match_obj:
-            return {}
+            result["_error"] = "Match not found in ESPN current-matches feed"
+            return result
 
-        # Get match ID and fetch scorecard
-        mid = match_obj.get("objectId") or match_obj.get("id")
-        if not mid:
-            return {}
+        detail = fetch_match_detail(match_obj)
+        if not detail:
+            result["_error"] = "Found match but could not fetch detail"
+            return result
 
-        sc = requests.get(
-            f"https://hs-consumer-api.espncricinfo.com/v1/pages/match/playing-xi"
-            f"?lang=en&matchId={mid}",
-            headers=HEADERS, timeout=6
-        )
-        if sc.status_code == 200:
-            scdata = sc.json()
-            for team_key in ["team1","team2"]:
-                t = scdata.get(team_key, {})
-                tname = t.get("name","")
-                xi = [p.get("name","") for p in t.get("playingXI",[]) if p.get("name")]
-                if xi:
-                    if ta_k in tname.lower():
-                        result["team_a_xi"] = xi
-                    else:
-                        result["team_b_xi"] = xi
+        t1, t2 = get_match_teams(detail) if detail.get("teams") else get_match_teams(match_obj)
+
+        # Playing XI — try common field names on the match detail payload
+        for team_data in (detail.get("teams", []) or []):
+            team_obj = team_data.get("team", {}) or {}
+            tname = team_obj.get("name", "")
+            xi_raw = (team_data.get("playingXI") or team_data.get("playing11") or
+                      team_data.get("squad") or [])
+            xi = [p.get("name", "") for p in xi_raw if isinstance(p, dict) and p.get("name")]
+            if xi:
+                if _sim(tname, team_a) >= _sim(tname, team_b):
+                    result["team_a_xi"] = xi
+                else:
+                    result["team_b_xi"] = xi
 
         # Toss info
-        toss = match_obj.get("toss",{})
+        toss = detail.get("toss", {}) or {}
         if toss:
-            result["toss_winner"] = toss.get("winnerTeamName","")
-            result["toss_choice"] = toss.get("decision","").lower()  # "bat" or "field"
+            result["toss_winner"] = (toss.get("winnerTeamName", "") or
+                                      (toss.get("winner", {}) or {}).get("name", ""))
+            result["toss_choice"] = (toss.get("decision", "") or "").lower()
 
     except Exception as e:
         result["_error"] = str(e)
