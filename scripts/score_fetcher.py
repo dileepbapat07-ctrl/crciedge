@@ -340,58 +340,62 @@ def _try_cricketdata(team_a: str, team_b: str, fmt: str) -> ScoreResult:
 # ── Strategy 2: ESPN Cricinfo unofficial JSON ─────────────────
 def _try_espn(team_a: str, team_b: str, match_date: str) -> ScoreResult:
     """
-    ESPN's unofficial API returns JSON for current matches.
-    Endpoint changes occasionally but usually stable within a season.
+    ESPNcricinfo's hs-consumer-api — same family of endpoints already
+    proven to work for espn_results.py and ballbyball_fetcher.py.
+    The old site.api.espn.com/apis/site/v2/sports/cricket/scoreboard
+    endpoint is unreliable for The Hundred and women's series (404s),
+    so this uses the live-matches feed instead.
     """
     if not HAS_REQUESTS:
         return ScoreResult(error="requests not installed")
-    try:
-        # ESPN Cricket live matches endpoint
-        r = requests.get(
-            "https://site.api.espn.com/apis/site/v2/sports/cricket/scoreboard",
-            headers=HEADERS, timeout=6
-        )
-        if r.status_code != 200:
-            return ScoreResult(error=f"ESPN HTTP {r.status_code}")
 
-        data = r.json()
-        ta_low = team_a.lower(); tb_low = team_b.lower()
+    ta_p, tb_p, ta_f, tb_f = _team_keys(team_a, team_b)
 
-        for event in data.get("events", []):
-            name = event.get("name", "").lower()
-            if any(ta_low.split()[-1] in name.split() or
-                   tb_low.split()[-1] in name.split() for _ in [1]):
-                # Try to parse score from event
-                comps = event.get("competitions", [{}])
-                if not comps:
+    urls = [
+        "https://hs-consumer-api.espncricinfo.com/v1/pages/matches/live?lang=en&limit=50",
+        "https://hs-consumer-api.espncricinfo.com/v1/pages/matches/recent?lang=en&limit=50",
+    ]
+
+    for url in urls:
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=6)
+            if r.status_code != 200:
+                continue
+
+            data = r.json()
+            matches = data.get("content", {}).get("matches", []) or []
+
+            for m in matches:
+                t1 = (m.get("team1", {}) or {}).get("name", "")
+                t2 = (m.get("team2", {}) or {}).get("name", "")
+                combined = (t1 + " " + t2).lower()
+                if not (ta_p in combined and tb_p in combined):
                     continue
-                comp = comps[0]
-                competitors = comp.get("competitors", [])
-                status = comp.get("status", {})
 
                 res = ScoreResult(success=True, source="ESPN")
-                res.match_status = status.get("type", {}).get("description", "")
+                res.match_status = m.get("statusText", "")
 
-                for competitor in competitors:
-                    score_str = competitor.get("score", "0")
-                    team_name = competitor.get("team", {}).get("displayName", "")
-                    if score_str and score_str != "0":
-                        # Parse "143/10 (99.0 ov)"
+                team1_score = m.get("team1", {}).get("scores", "") if m.get("team1") else ""
+                team2_score = m.get("team2", {}).get("scores", "") if m.get("team2") else ""
+
+                # Prefer whichever side has a live score
+                for score_str, team_name in [(team1_score, t1), (team2_score, t2)]:
+                    if score_str:
                         parsed = parse_score_from_text(score_str, team_a, team_b)
                         if parsed.success:
-                            res.score      = parsed.score
-                            res.wickets    = parsed.wickets
-                            res.balls_done = parsed.balls_done
+                            res.score        = parsed.score
+                            res.wickets      = parsed.wickets
+                            res.balls_done   = parsed.balls_done
                             res.batting_team = team_name
                             break
 
                 if res.score > 0:
                     return res
 
-        return ScoreResult(error="ESPN: match not found in scoreboard")
+        except Exception:
+            continue
 
-    except Exception as e:
-        return ScoreResult(error=f"ESPN exception: {e}")
+    return ScoreResult(error="ESPN: match not found in live/recent feeds")
 
 # ── Strategy 3: Cricbuzz / cricketdata.org ───────────────────
 def _try_cricbuzz(team_a: str, team_b: str) -> ScoreResult:
