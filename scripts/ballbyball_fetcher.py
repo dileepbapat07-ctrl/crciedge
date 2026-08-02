@@ -43,6 +43,17 @@ SEARCH_URLS = [
     "https://hs-consumer-api.espncricinfo.com/v1/pages/matches/results?lang=en&limit=50",
 ]
 
+# Paginated versions — recent/results feeds are global (all cricket, all
+# countries) so a specific match can fall off the first page within a day
+PAGINATED_URLS = [
+    "https://hs-consumer-api.espncricinfo.com/v1/pages/matches/recent?lang=en&limit=50&offset={off}",
+    "https://hs-consumer-api.espncricinfo.com/v1/pages/matches/results?lang=en&limit=50&offset={off}",
+]
+
+# Date-scoped schedule search — narrows to a specific day, much more
+# reliable for finding a known match than scrolling recent/results
+SCHEDULE_URL = "https://hs-consumer-api.espncricinfo.com/v1/pages/matches/schedule?lang=en&date={d}"
+
 COMMENTS_URL = ("https://hs-consumer-api.espncricinfo.com/v1/pages/match/"
                  "comments?lang=en&matchId={mid}&inningNumber={inn}&commentType=REGULAR&"
                  "sortDirection=DESC&fromInningOver=&limit=500")
@@ -62,38 +73,103 @@ def _team_key(name: str) -> str:
     return words[0] if words else _norm(name)[:4]
 
 
+def _scan_matches_list(matches: list, ta_k: str, tb_k: str, seen_pairs: list) -> dict | None:
+    """Check a list of match objects for a team_a/team_b match. Records
+    all team-name pairs seen (for diagnostics) as it goes."""
+    for m in matches:
+        t1 = (m.get("team1", {}) or {}).get("name", "")
+        t2 = (m.get("team2", {}) or {}).get("name", "")
+        if t1 or t2:
+            seen_pairs.append(f"{t1} vs {t2}")
+        combined = (t1 + " " + t2).lower()
+        if ta_k in combined and tb_k in combined:
+            mid = m.get("objectId") or m.get("id")
+            if mid:
+                return {
+                    "found": True, "match_id": str(mid),
+                    "team1": t1, "team2": t2,
+                    "status": m.get("statusText", ""),
+                }
+    return None
+
+
 # ── Step 1: find the ESPN match id ───────────────────────────
 def find_match_id(team_a: str, team_b: str, match_date: str) -> dict:
     """
-    Search live/recent/results feeds for a match matching team_a vs team_b
-    on match_date. Returns {"match_id":.., "found":True/False, "source":..}
+    Search ESPNcricinfo for a match between team_a and team_b on match_date.
+    Tries, in order:
+      1. live feed
+      2. date-scoped schedule endpoint (most reliable for a known date)
+      3. recent feed, paginated up to 3 pages (150 matches)
+      4. results feed, paginated up to 3 pages (150 matches)
+    Returns {"found":bool, "match_id":.., "error":.., "sample_matches":[...]}
+    on failure — sample_matches helps diagnose naming mismatches.
     """
     ta_k, tb_k = _team_key(team_a), _team_key(team_b)
+    seen_pairs: list[str] = []
 
-    for url in SEARCH_URLS:
-        try:
-            r = requests.get(url, headers=HEADERS, timeout=8)
-            if r.status_code != 200:
-                continue
+    # 1. Live matches (small list, cheap to check first)
+    try:
+        r = requests.get(SEARCH_URLS[0], headers=HEADERS, timeout=8)
+        if r.status_code == 200:
+            matches = r.json().get("content", {}).get("matches", []) or []
+            hit = _scan_matches_list(matches, ta_k, tb_k, seen_pairs)
+            if hit:
+                hit["source"] = "live"
+                return hit
+    except Exception:
+        pass
+
+    # 2. Date-scoped schedule — most reliable for a specific known date
+    try:
+        r = requests.get(SCHEDULE_URL.format(d=match_date), headers=HEADERS, timeout=8)
+        if r.status_code == 200:
             data = r.json()
-            matches = data.get("content", {}).get("matches", []) or []
+            # schedule endpoint groups by date; flatten
+            matches = []
+            for day in data.get("content", {}).get("matches", []) or []:
+                if isinstance(day, dict) and "matches" in day:
+                    matches.extend(day["matches"])
+                else:
+                    matches.append(day)
+            hit = _scan_matches_list(matches, ta_k, tb_k, seen_pairs)
+            if hit:
+                hit["source"] = "schedule"
+                return hit
+    except Exception:
+        pass
 
-            for m in matches:
-                t1 = (m.get("team1", {}) or {}).get("name", "")
-                t2 = (m.get("team2", {}) or {}).get("name", "")
-                combined = (t1 + " " + t2).lower()
-                if ta_k in combined and tb_k in combined:
-                    mid = m.get("objectId") or m.get("id")
-                    if mid:
-                        return {
-                            "found": True,
-                            "match_id": str(mid),
-                            "team1": t1, "team2": t2,
-                            "status": m.get("statusText", ""),
-                            "source": url.split("/")[-1].split("?")[0],
-                        }
-        except Exception:
-            continue
+    # 3 & 4. Paginated recent + results feeds
+    for base_url in PAGINATED_URLS:
+        for page in range(3):  # offsets 0, 50, 100 → up to 150 matches
+            try:
+                r = requests.get(base_url.format(off=page * 50), headers=HEADERS, timeout=8)
+                if r.status_code != 200:
+                    break
+                matches = r.json().get("content", {}).get("matches", []) or []
+                if not matches:
+                    break
+                hit = _scan_matches_list(matches, ta_k, tb_k, seen_pairs)
+                if hit:
+                    hit["source"] = base_url.split("/")[-1].split("?")[0] + f"_p{page}"
+                    return hit
+            except Exception:
+                break
+
+    # Nothing found — build a helpful diagnostic
+    close_matches = sorted(
+        set(seen_pairs),
+        key=lambda p: max(_sim(p.split(" vs ")[0], team_a), _sim(p.split(" vs ")[-1], team_b))
+                      if " vs " in p else 0,
+        reverse=True
+    )[:5]
+
+    return {
+        "found": False, "match_id": None,
+        "error": f"Match {team_a} vs {team_b} on {match_date} not found in live/schedule/recent/results feeds "
+                 f"(searched {len(seen_pairs)} matches across all sources)",
+        "sample_matches": close_matches,
+    }
 
     return {"found": False, "match_id": None, "error":
             f"Match {team_a} vs {team_b} on {match_date} not found in live/recent/results feeds"}
@@ -266,11 +342,17 @@ def fetch_and_store_match(
     if not found.get("found"):
         log["error"] = found.get("error", "Match not found")
         log["steps"].append(f"❌ {log['error']}")
+        samples = found.get("sample_matches", [])
+        if samples:
+            log["steps"].append("💡 Closest matches found on ESPN (check team name spelling):")
+            for s in samples:
+                log["steps"].append(f"   • {s}")
         return log
 
     mid = found["match_id"]
     log["match_id"] = mid
-    log["steps"].append(f"✅ Found match id {mid} ({found['team1']} vs {found['team2']}) — {found['status']}")
+    log["steps"].append(f"✅ Found match id {mid} ({found['team1']} vs {found['team2']}) "
+                         f"— {found.get('status','')} · source: {found.get('source','')}")
 
     # 2. Match info
     meta = fetch_match_info(mid)
