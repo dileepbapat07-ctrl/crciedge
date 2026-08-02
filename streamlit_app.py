@@ -2259,7 +2259,36 @@ elif page == "🎯 Ball-by-Ball Fetcher":
                 key="bb_overs"
             )
 
-    if st.button("🌐 Fetch ball-by-ball from ESPNcricinfo", type="primary", key="bb_fetch_btn"):
+    btn_col1, btn_col2 = st.columns([2, 1])
+    with btn_col1:
+        do_fetch = st.button("🌐 Fetch ball-by-ball from ESPNcricinfo", type="primary", key="bb_fetch_btn")
+    with btn_col2:
+        do_diag = st.button("🩺 Diagnose endpoints", key="bb_diag_btn",
+                             help="Test each ESPN endpoint directly and show raw responses")
+
+    if do_diag:
+        from ballbyball_fetcher import diagnose_endpoints
+        with st.spinner("Pinging ESPN endpoints..."):
+            diag = diagnose_endpoints(match_date_in)
+        st.markdown("#### 🩺 Endpoint diagnostics")
+        for d in diag:
+            status = d["status"]
+            ok = status == 200
+            icon = "✅" if ok else "❌"
+            with st.expander(f"{icon} {d['name']} · HTTP {status} · "
+                              f"{d.get('n_matches','?')} matches found"):
+                st.code(d["url"], language="text")
+                if d.get("error"):
+                    st.error(f"Error: {d['error']}")
+                if d.get("keys"):
+                    st.write(f"Top-level JSON keys: {d['keys']}")
+                if d.get("content_keys"):
+                    st.write(f"content{{}} keys: {d['content_keys']}")
+                if d.get("snippet"):
+                    st.text_area("Raw response snippet", d["snippet"], height=120,
+                                 key=f"diag_{d['name']}")
+
+    if do_fetch:
         if not team_a_in or not team_b_in:
             st.warning("Enter both team names")
         else:
@@ -2279,6 +2308,51 @@ elif page == "🎯 Ball-by-Ball Fetcher":
                 st.rerun()
             else:
                 st.error(f"❌ {result.get('error','Unknown error')}")
+
+    st.divider()
+
+    # ── One-time bulk download from Cricsheet ───────────────
+    st.markdown("### 📦 One-time bulk download (Cricsheet historical data)")
+    st.caption("Seeds the simulation with several seasons of ball-by-ball history in one go. "
+               "Run once per dataset — re-running just refreshes it.")
+
+    from parse_cricsheet import DATASETS
+
+    ds_col1, ds_col2 = st.columns([2, 1])
+    with ds_col1:
+        ds_key = st.selectbox(
+            "Dataset",
+            options=list(DATASETS.keys()),
+            format_func=lambda k: DATASETS[k]["label"],
+            key="bb_dataset_pick"
+        )
+    with ds_col2:
+        size = DATASETS[ds_key].get("size_mb")
+        st.caption(f"Size: ~{size} MB" if size else "Size: varies")
+
+    if st.button("⬇️ Download & ingest this dataset", key="bb_bulk_dl"):
+        from parse_cricsheet import download_and_ingest
+
+        progress_bar = st.progress(0.0, text="Starting download...")
+        def _progress(done, total):
+            if total > 0:
+                pct = min(done / total, 1.0)
+                progress_bar.progress(pct, text=f"Downloading... {done/1e6:.1f} / {total/1e6:.1f} MB")
+
+        with st.spinner("Downloading and parsing..."):
+            result = download_and_ingest(ds_key, db_path=BBDB, progress_cb=_progress)
+
+        progress_bar.empty()
+
+        if result["success"]:
+            st.success(f"✅ {result['label']} — {result['matches']} matches, "
+                       f"{result['balls']:,} deliveries ingested")
+            st.rerun()
+        else:
+            st.error(f"❌ {result.get('error', 'Unknown error')}")
+            if "not reachable" in str(result.get('error', '')) or "timed out" in str(result.get('error', '')):
+                st.info("💡 If this keeps failing, add `cricsheet.org` to your app's "
+                        "network egress allowlist in Streamlit Cloud settings.")
 
     st.divider()
 
