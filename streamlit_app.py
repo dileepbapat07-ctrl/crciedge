@@ -147,6 +147,7 @@ with st.sidebar:
         "🔴 Match dashboard",
         "👁 In-play engine",
         "👤 Player analytics",
+        "🎯 Ball-by-Ball Fetcher",
         "📅 Calendar & Targets",
         "📈 Bankroll tracker",
         "🧬 ELO ratings",
@@ -2164,145 +2165,430 @@ elif page == "👤 Player analytics":
 # PAGE: BANKROLL TRACKER
 # ══════════════════════════════════════════════════════════════════════════
 
+
+elif page == "🎯 Ball-by-Ball Fetcher":
+    st.title("🎯 Ball-by-Ball Fetcher")
+    st.caption("Fetch live/completed match commentary from ESPNcricinfo into the simulation database")
+    st.divider()
+
+    sys.path.insert(0, os.path.join(ROOT, "scripts"))
+
+    BBDB = os.path.join(ROOT, "db", "ball_by_ball.db")
+
+    # ── DB status ────────────────────────────────────────────
+    def _bb_stats():
+        if not os.path.exists(BBDB):
+            return {"matches": 0, "balls": 0, "venues": 0}
+        c = sqlite3.connect(BBDB)
+        try:
+            m = c.execute("SELECT COUNT(*) FROM matches").fetchone()[0]
+            b = c.execute("SELECT COUNT(*) FROM deliveries").fetchone()[0]
+            v = c.execute("SELECT COUNT(DISTINCT venue) FROM deliveries").fetchone()[0]
+        except Exception:
+            m, b, v = 0, 0, 0
+        c.close()
+        return {"matches": m, "balls": b, "venues": v}
+
+    stats = _bb_stats()
+    s1, s2, s3 = st.columns(3)
+    s1.metric("Matches stored",   stats["matches"])
+    s2.metric("Deliveries stored", f"{stats['balls']:,}")
+    s3.metric("Venues covered",   stats["venues"])
+    st.divider()
+
+    # ── Fetch form ───────────────────────────────────────────
+    st.markdown("### Fetch a match")
+
+    # Pre-fill from today's DB matches if available
+    conn_bb = sqlite3.connect(DB_PATH)
+    conn_bb.row_factory = sqlite3.Row
+    today_matches = conn_bb.execute("""
+        SELECT team_a, team_b, date, format FROM matches
+        WHERE date = ? ORDER BY team_a
+    """, (date.today().isoformat(),)).fetchall()
+    conn_bb.close()
+
+    if today_matches:
+        opts = ["— Select today's match —"] + [
+            f"{m['team_a']} vs {m['team_b']} ({m['format']})" for m in today_matches
+        ]
+        picked = st.selectbox("Quick-pick from today's schedule", opts, key="bb_pick")
+        if picked != opts[0]:
+            idx = opts.index(picked) - 1
+            default_a = today_matches[idx]["team_a"]
+            default_b = today_matches[idx]["team_b"]
+            default_date = today_matches[idx]["date"]
+            default_fmt = today_matches[idx]["format"]
+        else:
+            default_a, default_b, default_date, default_fmt = "", "", date.today().isoformat(), "T20"
+    else:
+        default_a, default_b, default_date, default_fmt = "", "", date.today().isoformat(), "T20"
+
+    fc1, fc2 = st.columns(2)
+    with fc1:
+        team_a_in = st.text_input("Team A", value=default_a, key="bb_ta")
+        match_date_in = st.text_input("Match date (YYYY-MM-DD)", value=default_date, key="bb_date")
+    with fc2:
+        team_b_in = st.text_input("Team B", value=default_b, key="bb_tb")
+        fmt_map = {"Test":50, "ODI":50, "T20I":20, "T20":20, "100b":10}
+        overs_in = st.selectbox(
+            "Overs/format unit",
+            options=[10, 20, 50],
+            index=[10,20,50].index(fmt_map.get(default_fmt, 20)),
+            format_func=lambda x: {10:"100-ball (10 sets)", 20:"T20 (20 overs)", 50:"ODI (50 overs)"}[x],
+            key="bb_overs"
+        )
+
+    if st.button("🌐 Fetch ball-by-ball from ESPNcricinfo", type="primary", key="bb_fetch_btn"):
+        if not team_a_in or not team_b_in:
+            st.warning("Enter both team names")
+        else:
+            from ballbyball_fetcher import fetch_and_store_match
+            with st.spinner("Fetching from ESPNcricinfo..."):
+                result = fetch_and_store_match(
+                    team_a_in, team_b_in, match_date_in,
+                    format_overs=overs_in, db_path=BBDB
+                )
+
+            with st.expander("🔍 Fetch log", expanded=True):
+                for line in result["steps"]:
+                    st.text(line)
+
+            if result["success"]:
+                st.success(f"✅ Stored {result['balls_fetched']} deliveries · Match ID: {result['match_id']}")
+                st.rerun()
+            else:
+                st.error(f"❌ {result.get('error','Unknown error')}")
+
+    st.divider()
+
+    # ── Browse stored matches ───────────────────────────────
+    st.markdown("### Stored matches")
+    if os.path.exists(BBDB):
+        conn_v = sqlite3.connect(BBDB)
+        conn_v.row_factory = sqlite3.Row
+        stored = conn_v.execute("""
+            SELECT match_id, match_date, team1, team2, venue, competition
+            FROM matches ORDER BY match_date DESC LIMIT 30
+        """).fetchall()
+        conn_v.close()
+
+        if stored:
+            for m in stored:
+                with st.expander(f"{m['match_date']} · {m['team1']} vs {m['team2']} · {m['venue'] or '?'}"):
+                    conn_d = sqlite3.connect(BBDB)
+                    conn_d.row_factory = sqlite3.Row
+                    balls = conn_d.execute("""
+                        SELECT innings, COUNT(*) balls, SUM(runs_total) runs, SUM(is_wicket) wkts
+                        FROM deliveries WHERE match_id=? GROUP BY innings
+                    """, (m["match_id"],)).fetchall()
+                    conn_d.close()
+                    for b in balls:
+                        st.write(f"Innings {b['innings']}: {b['balls']} balls · "
+                                 f"{b['runs']} runs · {b['wkts']} wickets")
+        else:
+            st.info("No matches fetched yet — use the form above")
+    else:
+        st.info("Database not created yet — fetch a match to initialise it")
+
+
 elif page == "📅 Calendar & Targets":
     import math
     from datetime import date, timedelta
+    from collections import defaultdict
+
+    EPOCH    = date(2026, 7, 28)
+    BASE     = 10_000.0
+    RATE     = 1.007          # 0.7% per match day
+    TODAY    = date.today()
+    DAY_N    = max(0, (TODAY - EPOCH).days)
+    TODAY_TGT = BASE * (RATE ** DAY_N)
 
     st.title("📅 Calendar & Targets")
-    st.markdown("Daily compound target at **1.007× per match day** from **€10,000** base · Jul 28 2026")
+    st.caption(f"€10,000 base · +0.7% per day compounded from Jul 28 2026 · Today = Day {DAY_N}")
+
+    # ── Today headline ──────────────────────────────────────
+    h1, h2, h3, h4 = st.columns(4)
+    h1.metric("Today's target",      f"€{TODAY_TGT:,.0f}")
+    h2.metric("Day number",          f"Day {DAY_N}")
+    h3.metric("30-day target",       f"€{BASE*(RATE**(DAY_N+30)):,.0f}")
+    h4.metric("90-day target",       f"€{BASE*(RATE**(DAY_N+90)):,.0f}")
     st.divider()
 
-    # ── Constants ─────────────────────────────────────────────
-    BASE        = 10_000.0
-    RATE        = 1.007
-    EPOCH       = date(2026, 7, 28)   # day 0
-    TODAY       = date.today()
-    DAY_N       = (TODAY - EPOCH).days
-    TODAY_TGT   = BASE * (RATE ** DAY_N)
+    # ── Odds API key ────────────────────────────────────────
+    odds_api_key = st.secrets.get("ODDS_API_KEY", "")
+    has_odds_api = bool(odds_api_key and odds_api_key not in ("", "your-key-here"))
+    if not has_odds_api:
+        st.info("💡 Add `ODDS_API_KEY` to Streamlit secrets to auto-fetch live odds from "
+                "the-odds-api.com (Pro/Business tier required for cricket). "
+                "Manual odds entry available below.")
 
-    # ── Today headline ────────────────────────────────────────
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Today's target",  f"€{TODAY_TGT:,.0f}")
-    c2.metric("Day number",      f"Day {DAY_N}")
-    c3.metric("Rate per day",    "+0.7%")
-    c4.metric("Base capital",    "€10,000")
-
-    st.divider()
-
-    # ── Load matches from DB ──────────────────────────────────
+    # ── Load matches ────────────────────────────────────────
     conn_cal = sqlite3.connect(DB_PATH)
     conn_cal.row_factory = sqlite3.Row
-
-    # Get all matches from today onwards, group by date
-    matches_raw = conn_cal.execute("""
-        SELECT date, team_a, team_b, format, gender, series, category
-        FROM matches
-        WHERE date >= ?
-        ORDER BY date, format, gender
-    """, (TODAY.isoformat(),)).fetchall()
+    cal_matches = conn_cal.execute("""
+        SELECT match_id, date, team_a, team_b, format, gender,
+               series, category, venue_id, city, country
+        FROM matches WHERE date >= ? AND date <= ?
+        ORDER BY date, gender, format
+    """, (TODAY.isoformat(), (TODAY + timedelta(days=90)).isoformat())).fetchall()
     conn_cal.close()
 
-    # Group by date
-    from collections import defaultdict
     by_date = defaultdict(list)
-    for m in matches_raw:
-        by_date[m["date"]].append(m)
+    for m in cal_matches:
+        by_date[m["date"]].append(dict(m))
 
-    # ── Build calendar ────────────────────────────────────────
-    # Show 90 days from today
-    SHOW_DAYS = 90
+    # ── Filters ─────────────────────────────────────────────
+    fc1, fc2, fc3 = st.columns(3)
+    with fc1:
+        fil_gender = st.selectbox("Gender", ["All","Men","Women"], key="cg")
+    with fc2:
+        fil_fmt    = st.selectbox("Format", ["All","Test","ODI","T20I","100b","T20"], key="cf")
+    with fc3:
+        fil_type   = st.selectbox("Type", ["All","International","Domestic"], key="ct")
 
-    st.markdown(f"#### Match calendar · {TODAY.strftime('%d %b %Y')} → {(TODAY + timedelta(days=SHOW_DAYS)).strftime('%d %b %Y')}")
-
-    # Filter controls
-    cal_col1, cal_col2, cal_col3 = st.columns(3)
-    with cal_col1:
-        show_gender = st.selectbox("Gender", ["All", "Men", "Women"], key="cal_gender")
-    with cal_col2:
-        show_format = st.selectbox("Format", ["All", "Test", "ODI", "T20I", "100b", "T20"], key="cal_format")
-    with cal_col3:
-        show_type = st.selectbox("Type", ["All", "International", "Domestic"], key="cal_type")
-
-    # ── Day by day table ──────────────────────────────────────
-    prev_month = ""
-    day_count = 0
-    total_matches = 0
-
-    for delta in range(SHOW_DAYS + 1):
-        d = TODAY + timedelta(days=delta)
-        ds = d.isoformat()
-        day_n = (d - EPOCH).days
-        target = BASE * (RATE ** day_n)
-
-        matches_today = by_date.get(ds, [])
-
-        # Apply filters
-        filtered = []
-        for m in matches_today:
-            if show_gender == "Men"   and m["gender"] != "male":   continue
-            if show_gender == "Women" and m["gender"] != "female": continue
-            if show_format != "All"   and m["format"] != show_format: continue
-            if show_type == "International" and m["category"] not in ("International","intl"): continue
-            if show_type == "Domestic"      and m["category"] in ("International","intl"):     continue
-            filtered.append(m)
-
-        if not filtered and show_format != "All":
-            continue  # skip empty days when filtered
-
-        # Month header
-        month_str = d.strftime("%B %Y")
-        if month_str != prev_month:
-            if prev_month:
-                st.markdown("---")
-            st.markdown(f"### {month_str}")
-            # Month summary columns
-            mc1, mc2 = st.columns(2)
-            month_start_n = (date(d.year, d.month, 1) - EPOCH).days
-            month_end_n   = month_start_n + 30
-            mc1.caption(f"Month target range: €{BASE*(RATE**month_start_n):,.0f} → €{BASE*(RATE**month_end_n):,.0f}")
-            mc2.caption(f"Growth this month: +{((RATE**30)-1)*100:.1f}%")
-            prev_month = month_str
-
-        # Day row
-        is_today = (d == TODAY)
-        is_weekend = d.weekday() >= 5
-
-        # Build match pills
-        match_strs = []
-        for m in filtered:
-            fmt_icon = {"Test":"🔴","ODI":"🟠","T20I":"🟢","T20":"🟢","100b":"🔵"}.get(m["format"],"⚪")
-            gender_tag = " (W)" if m["gender"] == "female" else ""
-            match_strs.append(f"{fmt_icon} {m['team_a']} vs {m['team_b']}{gender_tag}")
-
-        n_matches = len(filtered)
-        total_matches += n_matches
-
-        if is_today:
-            st.markdown(f"""
-<div style="border:2px solid #0ca30c;border-radius:8px;padding:10px 14px;margin:4px 0;background:#f0fdf4">
-<strong>TODAY — {d.strftime('%a %d %b')} · Day {day_n}</strong> &nbsp;|&nbsp;
-<span style="font-size:18px;font-weight:600;color:#0ca30c">Target: €{target:,.0f}</span>
-&nbsp;|&nbsp; <span style="color:#555">{n_matches} match{'es' if n_matches!=1 else ''}</span><br>
-<span style="font-size:13px;color:#333">{' &nbsp; '.join(match_strs) if match_strs else '<i>No matches in DB</i>'}</span>
-</div>""", unsafe_allow_html=True)
-        else:
-            day_bg = "#f8f8f7" if is_weekend else "transparent"
-            match_text = ' · '.join(match_strs[:6])
-            if len(match_strs) > 6:
-                match_text += f" +{len(match_strs)-6} more"
-            if not match_strs:
-                match_text = "*No matches*"
-
-            col_date, col_tgt, col_matches = st.columns([1.2, 1, 4.8])
-            col_date.markdown(f"**{d.strftime('%a %d %b')}**")
-            col_tgt.markdown(f"€{target:,.0f}")
-            col_matches.markdown(match_text)
-
-        day_count += 1
+    # ── Bankroll for stake calc ──────────────────────────────
+    cal_bank = st.session_state.get("bankroll", BASE)
+    daily_ev_target = 0.7  # percent
 
     st.divider()
-    st.caption(f"Showing {day_count} days · {total_matches} match-days in window · "
-               f"Rate: 1.007× compounded daily from €10,000 base on Jul 28 2026")
+
+    # ── Day loop ─────────────────────────────────────────────
+    SHOW = 90
+    prev_month = ""
+
+    for delta in range(SHOW + 1):
+        d        = TODAY + timedelta(days=delta)
+        ds       = d.isoformat()
+        day_n    = max(0, (d - EPOCH).days)
+        target   = BASE * (RATE ** day_n)
+        day_matches = by_date.get(ds, [])
+
+        # Filter
+        filtered = []
+        for m in day_matches:
+            if fil_gender == "Men"          and m["gender"] != "male":   continue
+            if fil_gender == "Women"        and m["gender"] != "female": continue
+            if fil_fmt    != "All"          and m["format"] != fil_fmt:  continue
+            if fil_type   == "International" and m["category"] not in ("International","intl"): continue
+            if fil_type   == "Domestic"      and m["category"] in ("International","intl"):     continue
+            filtered.append(m)
+
+        if not filtered:
+            continue
+
+        # Month separator
+        month_str = d.strftime("%B %Y")
+        if month_str != prev_month:
+            st.markdown(f"### {month_str}")
+            prev_month = month_str
+
+        is_today   = (d == TODAY)
+        is_weekend = d.weekday() >= 5
+
+        # Day header
+        day_label = f"{'🟢 TODAY — ' if is_today else ''}{d.strftime('%A %d %b')} · Day {day_n}"
+        border = "2px solid #0ca30c" if is_today else ("1px solid var(--border)" if is_weekend else "none")
+
+        with st.container():
+            if is_today or is_weekend:
+                st.markdown(
+                    f'<div style="border-left:{border};padding-left:10px;margin:6px 0">',
+                    unsafe_allow_html=True
+                )
+
+            dc1, dc2 = st.columns([3, 1])
+            with dc1:
+                st.markdown(f"**{day_label}**")
+            with dc2:
+                st.markdown(f"Target: **€{target:,.0f}**")
+
+            # Each match on this day
+            for m in filtered:
+                fmt_icon = {"Test":"🔴","ODI":"🟠","T20I":"🟢","T20":"🟢","100b":"🔵"}.get(m["format"],"⚪")
+                gender_tag = " (W)" if m["gender"] == "female" else ""
+                match_label = f"{fmt_icon} **{m['team_a']} vs {m['team_b']}**{gender_tag} · {m['format']} · {m.get('city','')}"
+
+                with st.expander(match_label, expanded=is_today):
+                    mc1, mc2 = st.columns(2)
+
+                    # ── Odds section ───────────────────────
+                    mc1.markdown("**Odds**")
+                    odds_key = f"odds_{m['match_id']}"
+
+                    # Try auto-fetch if key available and today's match
+                    if has_odds_api and delta <= 1:
+                        if odds_key not in st.session_state:
+                            with st.spinner("Fetching odds..."):
+                                try:
+                                    sys.path.insert(0, os.path.join(ROOT, "scripts"))
+                                    from odds_fetcher import fetch_odds
+                                    res = fetch_odds(
+                                        m["team_a"], m["team_b"],
+                                        ds, odds_api_key
+                                    )
+                                    st.session_state[odds_key] = res
+                                except Exception as e:
+                                    st.session_state[odds_key] = {"success": False, "error": str(e)}
+
+                        api_odds = st.session_state.get(odds_key, {})
+                        if api_odds.get("success"):
+                            mc1.success(f"Auto-fetched · {api_odds.get('best_book','')}")
+                            default_a = float(api_odds.get("odds_a") or 2.0)
+                            default_b = float(api_odds.get("odds_b") or 2.0)
+                            if api_odds.get("requests_remaining") is not None:
+                                mc1.caption(f"API requests remaining: {api_odds['requests_remaining']}")
+                        else:
+                            if api_odds.get("source") == "tier_error":
+                                mc1.warning("Cricket needs Pro/Business tier on the-odds-api.com")
+                            elif api_odds.get("error"):
+                                mc1.caption(f"Auto-fetch: {api_odds['error']}")
+                            default_a = 2.0
+                            default_b = 2.0
+                    else:
+                        default_a = 2.0
+                        default_b = 2.0
+
+                    # Manual odds inputs (always shown, pre-filled from API if available)
+                    oc1, oc2, oc3 = st.columns(3)
+                    odds_a = oc1.number_input(
+                        f"{m['team_a']} odds",
+                        min_value=1.01, max_value=50.0,
+                        value=default_a, step=0.05,
+                        format="%.2f",
+                        key=f"oa_{m['match_id']}"
+                    )
+                    odds_b = oc2.number_input(
+                        f"{m['team_b']} odds",
+                        min_value=1.01, max_value=50.0,
+                        value=default_b, step=0.05,
+                        format="%.2f",
+                        key=f"ob_{m['match_id']}"
+                    )
+                    draw_shown = m["format"] == "Test"
+                    if draw_shown:
+                        odds_draw = oc3.number_input(
+                            "Draw odds",
+                            min_value=1.01, max_value=50.0,
+                            value=3.5, step=0.05,
+                            format="%.2f",
+                            key=f"od_{m['match_id']}"
+                        )
+                    else:
+                        odds_draw = None
+
+                    # ── Model probability ──────────────────
+                    mc2.markdown("**Model signal**")
+                    model_key = f"model_{m['match_id']}"
+                    if model_key not in st.session_state:
+                        try:
+                            sys.path.insert(0, os.path.join(ROOT, "player_engine"))
+                            sys.path.insert(0, os.path.join(ROOT, "elo_engine"))
+                            from player_signal import get_player_signal
+                            sig = get_player_signal(
+                                m["match_id"], m["team_a"], m["team_b"],
+                                "T20" if m["format"] in ("100b","T20I") else m["format"],
+                                m.get("venue_id",""), m["gender"]
+                            )
+                            st.session_state[model_key] = sig
+                        except Exception:
+                            st.session_state[model_key] = None
+
+                    sig = st.session_state.get(model_key)
+
+                    # ELO win probability
+                    try:
+                        from elo_engine.elo_model import get_win_probability
+                        elo_prob = get_win_probability(m["team_a"], m["team_b"], m["format"], m.get("venue_id",""))
+                    except Exception:
+                        elo_prob = None
+
+                    # Combine ELO + player signal into model probability
+                    if sig and elo_prob:
+                        sig_factor = (sig.signal_factor - 5.0) / 5.0 * 0.08
+                        model_prob_a = max(0.1, min(0.9, elo_prob + sig_factor))
+                    elif elo_prob:
+                        model_prob_a = elo_prob
+                    else:
+                        model_prob_a = 0.5
+
+                    mc2.write(f"ELO prob ({m['team_a']}): **{model_prob_a*100:.1f}%**")
+                    if sig:
+                        mc2.write(f"Signal: {sig.signal_factor:.1f}/10 · {sig.data_quality}")
+
+                    # ── EV calculation ─────────────────────
+                    st.markdown("---")
+                    sys.path.insert(0, os.path.join(ROOT, "scripts"))
+                    try:
+                        from odds_fetcher import compute_ev, daily_target_stake
+                        ev_a = compute_ev(model_prob_a, odds_a)
+                        ev_b = compute_ev(1 - model_prob_a, odds_b)
+
+                        # Pick best bet
+                        bets = []
+                        if ev_a["is_positive_ev"]:
+                            bets.append({"team": m["team_a"], "odds": odds_a, "ev": ev_a, "prob": model_prob_a})
+                        if ev_b["is_positive_ev"]:
+                            bets.append({"team": m["team_b"], "odds": odds_b, "ev": ev_b, "prob": 1-model_prob_a})
+                        bets.sort(key=lambda x: x["ev"]["edge_pct"], reverse=True)
+
+                        if bets:
+                            best = bets[0]
+                            stake_info = daily_target_stake(
+                                bankroll=cal_bank,
+                                target_ev_pct=daily_ev_target,
+                                edge_pct=best["ev"]["edge_pct"],
+                                decimal_odds=best["odds"],
+                                max_stake_pct=0.12
+                            )
+                            bc1, bc2, bc3, bc4 = st.columns(4)
+                            bc1.metric("Back",         best["team"])
+                            bc2.metric("Odds",         f"{best['odds']:.2f}")
+                            bc3.metric("Edge",         f"+{best['ev']['edge_pct']:.1f}%")
+                            bc4.metric("Rec. stake",   f"€{stake_info['stake_eur']:,.0f}")
+
+                            kelly_pct = best["ev"]["kelly_fraction"] * 100
+                            exp_ret   = stake_info["expected_return_pct"]
+                            st.success(
+                                f"✅ +EV bet · Kelly: {kelly_pct:.1f}% · "
+                                f"Stake: €{stake_info['stake_eur']:,.0f} ({stake_info['stake_pct']:.1f}% of bank) · "
+                                f"Expected return: +{exp_ret:.2f}% of bank"
+                            )
+                            # Contribution to daily target
+                            target_pct = (target - cal_bank) / cal_bank * 100 if cal_bank > 0 else 0.7
+                            coverage   = min(100, exp_ret / 0.7 * 100) if exp_ret > 0 else 0
+                            st.progress(min(1.0, coverage/100),
+                                        text=f"Covers {coverage:.0f}% of today's 0.7% target")
+                        else:
+                            st.warning(
+                                f"No +EV bet found at current odds · "
+                                f"Model favours {m['team_a']} ({model_prob_a*100:.0f}%) · "
+                                f"Implied from odds: A={100/odds_a:.0f}% B={100/odds_b:.0f}%"
+                            )
+
+                        # Show both EVs
+                        with st.expander("Full EV breakdown"):
+                            evc1, evc2 = st.columns(2)
+                            evc1.markdown(f"**{m['team_a']}** @ {odds_a:.2f}")
+                            evc1.write(f"Model prob: {model_prob_a*100:.1f}%")
+                            evc1.write(f"Implied:    {ev_a['implied_prob']}%")
+                            evc1.write(f"Edge:       {ev_a['edge_pct']:+.2f}%")
+                            evc1.write(f"Kelly:      {ev_a['kelly_fraction']*100:.1f}%")
+
+                            evc2.markdown(f"**{m['team_b']}** @ {odds_b:.2f}")
+                            evc2.write(f"Model prob: {(1-model_prob_a)*100:.1f}%")
+                            evc2.write(f"Implied:    {ev_b['implied_prob']}%")
+                            evc2.write(f"Edge:       {ev_b['edge_pct']:+.2f}%")
+                            evc2.write(f"Kelly:      {ev_b['kelly_fraction']*100:.1f}%")
+
+                    except Exception as ev_err:
+                        st.error(f"EV calc error: {ev_err}")
+
+            if is_today or is_weekend:
+                st.markdown('</div>', unsafe_allow_html=True)
+
+        if not is_today:
+            st.markdown("")   # spacing
 
 
 elif page == "📈 Bankroll tracker":
