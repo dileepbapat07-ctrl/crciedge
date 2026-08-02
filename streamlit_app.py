@@ -1168,12 +1168,37 @@ elif page == "🔴 Match dashboard":
                                     except Exception as _ex:
                                         ref_status.warning(f"Lookup error: {_ex}")
                             else:
-                                # Live match — use normal fetcher
+                                # Live match — try live sources first
                                 sys.path.insert(0, os.path.join(ROOT, "scripts"))
                                 from score_fetcher import fetch_live_score
                                 res = fetch_live_score(ta, tb, match["date"], fmt, api_key=_ak)
+
+                                # If live sources found nothing, the match may
+                                # already be finished (played today, already
+                                # over) — fall back to the completed-match
+                                # lookup instead of just giving up.
+                                handled_via_result_lookup = False
+                                if not res.success and not res.match_status:
+                                    try:
+                                        from espn_results import fetch_match_result
+                                        _cd_key = (st.secrets.get("CRICKETDATA_KEY","TESTKEY0273")
+                                                   if hasattr(st,"secrets") else "TESTKEY0273")
+                                        _res2 = fetch_match_result(ta, tb, match["date"], _cd_key)
+                                        if _res2 and _res2.winner:
+                                            ref_status.success(
+                                                f"**{_res2.team1 or ta}**: {_res2.score1}\n\n"
+                                                f"**{_res2.team2 or tb}**: {_res2.score2}"
+                                            )
+                                            ref_status.info(f"🏆 {_res2.result_str} [{_res2.source}] "
+                                                             f"(found via completed-match lookup)")
+                                            handled_via_result_lookup = True
+                                    except Exception:
+                                        pass
+
                                 st.session_state[f"fetch_log_{mid}"] = res
-                                if res.success:
+                                if handled_via_result_lookup:
+                                    pass
+                                elif res.success:
                                     fetched = dict(score_d)
                                     fetched["score"]      = res.score
                                     fetched["wickets"]    = res.wickets
@@ -2263,30 +2288,26 @@ elif page == "🎯 Ball-by-Ball Fetcher":
     with btn_col1:
         do_fetch = st.button("🌐 Fetch ball-by-ball from ESPNcricinfo", type="primary", key="bb_fetch_btn")
     with btn_col2:
-        do_diag = st.button("🩺 Diagnose endpoints", key="bb_diag_btn",
-                             help="Test each ESPN endpoint directly and show raw responses")
+        do_diag = st.button("🩺 Test current-matches endpoint", key="bb_diag_btn",
+                             help="Confirmed-working endpoint from a real production integration (xbar-plugins)")
 
     if do_diag:
-        from ballbyball_fetcher import diagnose_endpoints
-        with st.spinner("Pinging ESPN endpoints..."):
-            diag = diagnose_endpoints(match_date_in)
-        st.markdown("#### 🩺 Endpoint diagnostics")
-        for d in diag:
-            status = d["status"]
-            ok = status == 200
-            icon = "✅" if ok else "❌"
-            with st.expander(f"{icon} {d['name']} · HTTP {status} · "
-                              f"{d.get('n_matches','?')} matches found"):
-                st.code(d["url"], language="text")
-                if d.get("error"):
-                    st.error(f"Error: {d['error']}")
-                if d.get("keys"):
-                    st.write(f"Top-level JSON keys: {d['keys']}")
-                if d.get("content_keys"):
-                    st.write(f"content{{}} keys: {d['content_keys']}")
-                if d.get("snippet"):
-                    st.text_area("Raw response snippet", d["snippet"], height=120,
-                                 key=f"diag_{d['name']}")
+        from espn_common import diagnose
+        with st.spinner("Pinging ESPNcricinfo current-matches endpoint..."):
+            diag = diagnose()
+        st.markdown("#### 🩺 Endpoint diagnostic")
+        st.code(diag["url"], language="text")
+        ok = diag["status"] == 200
+        icon = "✅" if ok else "❌"
+        st.write(f"{icon} HTTP {diag['status']} · {diag.get('n_matches','?')} matches found")
+        if diag.get("error"):
+            st.error(diag["error"])
+        if diag.get("top_level_keys"):
+            st.write(f"Top-level JSON keys: {diag['top_level_keys']}")
+        if diag.get("sample_teams"):
+            st.write("Sample matches found right now:")
+            for t in diag["sample_teams"]:
+                st.text(f"  • {t}")
 
     if do_fetch:
         if not team_a_in or not team_b_in:
