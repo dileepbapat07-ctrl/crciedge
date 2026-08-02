@@ -8,7 +8,7 @@ Deploy to: share.streamlit.io
 
 import streamlit as st
 import sqlite3, sys, os, math
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 # ── Path setup ─────────────────────────────────────────────────────────────
 ROOT = os.path.dirname(__file__)
@@ -2199,45 +2199,65 @@ elif page == "🎯 Ball-by-Ball Fetcher":
     # ── Fetch form ───────────────────────────────────────────
     st.markdown("### Fetch a match")
 
-    # Pre-fill from today's DB matches if available
+    # Pre-fill from today's + yesterday's DB matches if available
+    yesterday = (date.today() - timedelta(days=1)).isoformat()
     conn_bb = sqlite3.connect(DB_PATH)
     conn_bb.row_factory = sqlite3.Row
     today_matches = conn_bb.execute("""
         SELECT team_a, team_b, date, format FROM matches
-        WHERE date = ? ORDER BY team_a
-    """, (date.today().isoformat(),)).fetchall()
+        WHERE date IN (?, ?) ORDER BY date DESC, team_a
+    """, (date.today().isoformat(), yesterday)).fetchall()
     conn_bb.close()
 
-    if today_matches:
-        opts = ["— Select today's match —"] + [
-            f"{m['team_a']} vs {m['team_b']} ({m['format']})" for m in today_matches
-        ]
-        picked = st.selectbox("Quick-pick from today's schedule", opts, key="bb_pick")
-        if picked != opts[0]:
-            idx = opts.index(picked) - 1
-            default_a = today_matches[idx]["team_a"]
-            default_b = today_matches[idx]["team_b"]
-            default_date = today_matches[idx]["date"]
-            default_fmt = today_matches[idx]["format"]
-        else:
-            default_a, default_b, default_date, default_fmt = "", "", date.today().isoformat(), "T20"
-    else:
-        default_a, default_b, default_date, default_fmt = "", "", date.today().isoformat(), "T20"
+    fmt_map = {"Test":50, "ODI":50, "T20I":20, "T20":20, "100b":10}
 
-    fc1, fc2 = st.columns(2)
-    with fc1:
-        team_a_in = st.text_input("Team A", value=default_a, key="bb_ta")
-        match_date_in = st.text_input("Match date (YYYY-MM-DD)", value=default_date, key="bb_date")
-    with fc2:
-        team_b_in = st.text_input("Team B", value=default_b, key="bb_tb")
-        fmt_map = {"Test":50, "ODI":50, "T20I":20, "T20":20, "100b":10}
-        overs_in = st.selectbox(
-            "Overs/format unit",
-            options=[10, 20, 50],
-            index=[10,20,50].index(fmt_map.get(default_fmt, 20)),
-            format_func=lambda x: {10:"100-ball (10 sets)", 20:"T20 (20 overs)", 50:"ODI (50 overs)"}[x],
-            key="bb_overs"
-        )
+    if today_matches:
+        def _day_tag(d):
+            if d == date.today().isoformat(): return "Today"
+            if d == yesterday: return "Yesterday"
+            return d
+        opts = [f"{_day_tag(m['date'])} — {m['team_a']} vs {m['team_b']} ({m['format']})"
+                for m in today_matches]
+        opts.append("✏️ Enter manually (match not in today's/yesterday's schedule)")
+        picked = st.selectbox("Select match", opts, key="bb_pick")
+
+        if picked != opts[-1]:
+            # Quick-pick chosen — use it directly, no retyping needed
+            idx = opts.index(picked)
+            team_a_in    = today_matches[idx]["team_a"]
+            team_b_in    = today_matches[idx]["team_b"]
+            match_date_in = today_matches[idx]["date"]
+            overs_in     = fmt_map.get(today_matches[idx]["format"], 20)
+            st.caption(f"📅 {match_date_in} · {team_a_in} vs {team_b_in} · "
+                       f"{today_matches[idx]['format']}")
+        else:
+            # Manual entry fallback
+            fc1, fc2 = st.columns(2)
+            with fc1:
+                team_a_in     = st.text_input("Team A", key="bb_ta")
+                match_date_in = st.text_input("Match date (YYYY-MM-DD)",
+                                               value=date.today().isoformat(), key="bb_date")
+            with fc2:
+                team_b_in = st.text_input("Team B", key="bb_tb")
+                overs_in  = st.selectbox(
+                    "Overs/format unit", options=[10, 20, 50], index=1,
+                    format_func=lambda x: {10:"100-ball (10 sets)", 20:"T20 (20 overs)", 50:"ODI (50 overs)"}[x],
+                    key="bb_overs"
+                )
+    else:
+        st.info("No matches scheduled today in the database — enter details manually")
+        fc1, fc2 = st.columns(2)
+        with fc1:
+            team_a_in     = st.text_input("Team A", key="bb_ta")
+            match_date_in = st.text_input("Match date (YYYY-MM-DD)",
+                                           value=date.today().isoformat(), key="bb_date")
+        with fc2:
+            team_b_in = st.text_input("Team B", key="bb_tb")
+            overs_in  = st.selectbox(
+                "Overs/format unit", options=[10, 20, 50], index=1,
+                format_func=lambda x: {10:"100-ball (10 sets)", 20:"T20 (20 overs)", 50:"ODI (50 overs)"}[x],
+                key="bb_overs"
+            )
 
     if st.button("🌐 Fetch ball-by-ball from ESPNcricinfo", type="primary", key="bb_fetch_btn"):
         if not team_a_in or not team_b_in:
