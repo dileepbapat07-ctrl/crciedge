@@ -340,62 +340,69 @@ def _try_cricketdata(team_a: str, team_b: str, fmt: str) -> ScoreResult:
 # ── Strategy 2: ESPN Cricinfo unofficial JSON ─────────────────
 def _try_espn(team_a: str, team_b: str, match_date: str) -> ScoreResult:
     """
-    ESPNcricinfo's hs-consumer-api — same family of endpoints already
-    proven to work for espn_results.py and ballbyball_fetcher.py.
-    The old site.api.espn.com/apis/site/v2/sports/cricket/scoreboard
-    endpoint is unreliable for The Hundred and women's series (404s),
-    so this uses the live-matches feed instead.
+    Uses the CONFIRMED-WORKING ESPNcricinfo hs-consumer-api structure,
+    verified against a real production integration (matryer/xbar-plugins
+    live_cricket.2m.py). Key corrections vs earlier attempts:
+      - matches list endpoint is /matches/current, not /live|recent|results
+      - matches list is top-level `data["matches"]`, not nested in `content`
+      - team names come from a `match["teams"]` LIST of {"team":{"name":}}
+        objects, not `match["team1"]`/`match["team2"]` fields
+      - score/innings detail requires a SEPARATE call to /match/home using
+        both seriesId AND matchId
     """
     if not HAS_REQUESTS:
         return ScoreResult(error="requests not installed")
 
-    ta_p, tb_p, ta_f, tb_f = _team_keys(team_a, team_b)
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from espn_common import find_match, fetch_match_detail, get_match_teams
+    except Exception as e:
+        return ScoreResult(error=f"espn_common import failed: {e}")
 
-    urls = [
-        "https://hs-consumer-api.espncricinfo.com/v1/pages/matches/live?lang=en&limit=50",
-        "https://hs-consumer-api.espncricinfo.com/v1/pages/matches/recent?lang=en&limit=50",
-    ]
+    match_obj = find_match(team_a, team_b)
+    if not match_obj:
+        return ScoreResult(error="ESPN: match not found in current-matches feed "
+                                  "(covers live/upcoming/recently-finished only)")
 
-    for url in urls:
-        try:
-            r = requests.get(url, headers=HEADERS, timeout=6)
-            if r.status_code != 200:
-                continue
+    detail = fetch_match_detail(match_obj)
+    if not detail:
+        return ScoreResult(error="ESPN: found match but could not fetch detail")
 
-            data = r.json()
-            matches = data.get("content", {}).get("matches", []) or []
+    t1, t2 = get_match_teams(detail) if detail.get("teams") else get_match_teams(match_obj)
 
-            for m in matches:
-                t1 = (m.get("team1", {}) or {}).get("name", "")
-                t2 = (m.get("team2", {}) or {}).get("name", "")
-                combined = (t1 + " " + t2).lower()
-                if not (ta_p in combined and tb_p in combined):
-                    continue
+    res = ScoreResult(success=False, source="ESPN")
+    res.match_status = detail.get("statusText", match_obj.get("statusText", ""))
 
-                res = ScoreResult(success=True, source="ESPN")
-                res.match_status = m.get("statusText", "")
+    toss = detail.get("toss", {}) or {}
+    res.toss_winner = toss.get("winnerTeamName", "") or (toss.get("winner", {}) or {}).get("name", "")
+    res.toss_choice = toss.get("decision", "")
 
-                team1_score = m.get("team1", {}).get("scores", "") if m.get("team1") else ""
-                team2_score = m.get("team2", {}).get("scores", "") if m.get("team2") else ""
+    # Try to find score in innings data (structure varies by match state)
+    innings_list = detail.get("innings", []) or detail.get("liveInnings", []) or []
+    for inn in innings_list:
+        score_str = inn.get("liveScore", "") or inn.get("score", "")
+        team_name = (inn.get("team", {}) or {}).get("name", "")
+        if score_str:
+            parsed = parse_score_from_text(str(score_str), team_a, team_b)
+            if parsed.success:
+                res.score        = parsed.score
+                res.wickets      = parsed.wickets
+                res.balls_done   = parsed.balls_done
+                res.batting_team = team_name
+                res.success      = True
+                break
 
-                # Prefer whichever side has a live score
-                for score_str, team_name in [(team1_score, t1), (team2_score, t2)]:
-                    if score_str:
-                        parsed = parse_score_from_text(score_str, team_a, team_b)
-                        if parsed.success:
-                            res.score        = parsed.score
-                            res.wickets      = parsed.wickets
-                            res.balls_done   = parsed.balls_done
-                            res.batting_team = team_name
-                            break
+    if res.success:
+        return res
 
-                if res.score > 0:
-                    return res
+    if res.match_status == "NotStarted" or "not started" in res.match_status.lower():
+        return res  # caller checks match_status even without a score
 
-        except Exception:
-            continue
-
-    return ScoreResult(error="ESPN: match not found in live/recent feeds")
+    return ScoreResult(
+        error=f"ESPN: match found ({t1} vs {t2}, status: {res.match_status}) "
+              f"but could not parse score from response",
+        match_status=res.match_status
+    )
 
 # ── Strategy 3: Cricbuzz / cricketdata.org ───────────────────
 def _try_cricbuzz(team_a: str, team_b: str) -> ScoreResult:
