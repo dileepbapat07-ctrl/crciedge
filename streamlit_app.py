@@ -2364,10 +2364,21 @@ elif page == "🎲 Match Simulator":
                         st.text(f"{b.position}. {b.name}  (avg {b.avg:.0f}, SR {b.sr:.0f}, form {b.form:.1f})")
 
     st.divider()
-    st.caption("⚠️ Model uses career stats + venue scoring scale (from public ground records) "
-               "+ a simplified batting/bowling-style matchup heuristic. Still no phase-specific "
-               "(powerplay/middle/death) rates or real batter-vs-bowler history — that needs "
-               "ball-by-ball data, which isn't loaded yet.")
+    if 'last_sim_result' in st.session_state:
+        r = st.session_state['last_sim_result']
+        st.caption(
+            f"✅ Model uses: career stats + form · real venue scoring (from {r.get('venue_sample_matches','?')} "
+            f"actual matches) · {r.get('real_matchup_pairs',0)} real batter-vs-bowler head-to-head pairs · "
+            f"{r.get('real_phase_bowlers',0)} bowlers assigned by real powerplay/middle/death tendencies. "
+            f"Style-heuristic and league-average stats fill in only where real history is too thin "
+            f"(<6 balls for matchups, <10 for phase data)."
+        )
+    else:
+        st.caption("ℹ️ Model uses career stats + form, real venue scoring data, real batter-vs-bowler "
+                   "head-to-head history, and real powerplay/middle/death bowling tendencies — all "
+                   "derived from 672,014 real deliveries. Falls back to style-based heuristics only "
+                   "where a specific player pairing has too little real history to trust. Run a "
+                   "simulation to see exact coverage numbers for this matchup.")
 
 
 elif page == "🎯 Ball-by-Ball Fetcher":
