@@ -30,6 +30,22 @@ from collections import defaultdict
 ROOT   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB     = os.path.join(ROOT, "db", "player_engine.db")
 
+
+def _has_column(db_path: str, table: str, column: str) -> bool:
+    """
+    Check if a column exists in a table -- used to gracefully degrade
+    when the deployed DB is an older version than the code (e.g.
+    missing cricsheet_name after a schema upgrade), instead of a hard
+    crash on every simulation.
+    """
+    try:
+        conn = sqlite3.connect(db_path)
+        cols = [c[1] for c in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+        conn.close()
+        return column in cols
+    except Exception:
+        return False
+
 # -- League-average baselines (T20) -- used when a player has no stats --
 LEAGUE_AVG_SR       = 128.0   # runs per 100 balls
 LEAGUE_AVG_BAT_AVG  = 26.0    # runs per dismissal
@@ -660,8 +676,11 @@ def build_lineup_from_db(team_name: str, fmt: str = "T20", db_path: str = DB) ->
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
 
-    rows = conn.execute("""
-        SELECT name, batting_position, role, is_key_player, batting_style, bowling_style, cricsheet_name,
+    has_cs = _has_column(db_path, "players", "cricsheet_name")
+    cs_col = "cricsheet_name" if has_cs else "NULL as cricsheet_name"
+
+    rows = conn.execute(f"""
+        SELECT name, batting_position, role, is_key_player, batting_style, bowling_style, {cs_col},
                t20_avg, t20_sr, t20_wkts, t20_bowl_avg, t20_bowl_econ, t20_bowl_sr
         FROM players
         WHERE current_franchise=? OR team=?
@@ -853,8 +872,12 @@ def build_lineup_from_xi(
 
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
-    all_players = conn.execute("""
-        SELECT name, role, name_aliases, is_key_player, batting_style, bowling_style, cricsheet_name,
+
+    has_cs = _has_column(db_path, "players", "cricsheet_name")
+    cs_col = "cricsheet_name" if has_cs else "NULL as cricsheet_name"
+
+    all_players = conn.execute(f"""
+        SELECT name, role, name_aliases, is_key_player, batting_style, bowling_style, {cs_col},
                t20_avg, t20_sr, t20_wkts, t20_bowl_avg, t20_bowl_econ, t20_bowl_sr
         FROM players
     """).fetchall()
