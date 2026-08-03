@@ -225,43 +225,44 @@ def build_matchup_cache(
     return cache
 
 
-def get_bowler_phase_profile(cricsheet_name: str, ball_db_path: str) -> dict:
+def get_bowler_phase_profile(cricsheet_name: str, db_path: str) -> dict:
     """
     Query real historical phase distribution (powerplay/middle/death) for
-    a bowler from ball_by_ball.db. Returns {"powerplay":pct,"middle":pct,
-    "death":pct,"total_balls":n} or None if no data / DB unavailable.
+    a bowler from the pre-aggregated bowler_phase_profile table (lives in
+    player_engine.db -- the small, shippable DB -- NOT the 245MB raw
+    ball_by_ball.db, which isn't deployed to production).
+
+    Returns {"powerplay":pct,"middle":pct,"death":pct,"total_balls":n}
+    or None if no data / table doesn't exist yet (older DB version).
     """
-    import os
-    if not ball_db_path or not os.path.exists(ball_db_path):
+    if not cricsheet_name or not db_path:
         return None
     try:
-        conn = sqlite3.connect(ball_db_path)
-        rows = conn.execute(
-            "SELECT phase, COUNT(*) n FROM deliveries WHERE bowler=? GROUP BY phase",
+        conn = sqlite3.connect(db_path)
+        row = conn.execute(
+            "SELECT powerplay_pct, middle_pct, death_pct, total_balls "
+            "FROM bowler_phase_profile WHERE bowler_cricsheet=?",
             (cricsheet_name,)
-        ).fetchall()
+        ).fetchone()
         conn.close()
-        counts = {r[0]: r[1] for r in rows}
-        total = sum(counts.values())
-        if total < 10:
+        if not row:
             return None
         return {
-            "powerplay": counts.get("powerplay", 0) / total,
-            "middle":    counts.get("middle", 0) / total,
-            "death":     counts.get("death", 0) / total,
-            "total_balls": total,
+            "powerplay": row[0], "middle": row[1], "death": row[2],
+            "total_balls": row[3],
         }
     except Exception:
-        return None
+        return None  # table may not exist on an older/unmigrated DB
 
 
 def build_realistic_bowling_sequence(
-    bowlers: list, total_sets: int = 10, ball_db_path: str = "",
+    bowlers: list, total_sets: int = 10, db_path: str = "",
 ) -> list:
     """
     Build a bowling sequence (one bowler per set) using REAL historical
-    phase preferences (from ball_by_ball.db) when available, falling
-    back to a sensible default (pace early/late, spin middle) otherwise.
+    phase preferences (from the pre-aggregated bowler_phase_profile
+    table) when available, falling back to a sensible default (pace
+    early/late, spin middle) otherwise.
 
     total_sets: number of sets/overs in the innings (10 for Hundred, 20 for T20).
     """
@@ -270,7 +271,7 @@ def build_realistic_bowling_sequence(
 
     profiles = {}
     for b in bowlers:
-        prof = get_bowler_phase_profile(b.cricsheet_name, ball_db_path) if b.cricsheet_name and ball_db_path else None
+        prof = get_bowler_phase_profile(b.cricsheet_name, db_path) if b.cricsheet_name and db_path else None
         if not prof:
             if b.bowling_style in ("legspin", "offbreak", "sla"):
                 prof = {"powerplay": 0.15, "middle": 0.65, "death": 0.20, "total_balls": 0}
@@ -474,6 +475,8 @@ def simulate_innings(
     rng: random.Random = None,
     venue_scale: float = 1.0,
     matchup_cache: dict = None,
+    db_path: str = "",
+    bowling_sequence: list = None,
 ) -> InningsResult:
     rng = rng or random.Random()
     result = InningsResult(batting_team=batting.name)
@@ -486,14 +489,29 @@ def simulate_innings(
     next_in = 2
 
     balls_in_over = 0
-    over_num = 0
-    bowler_idx = 0
-
-    bowlers_available = [b for b in bowling.bowlers if b.max_overs > 0]
-    if not bowlers_available:
-        bowlers_available = bowling.bowlers[:5]
-
     balls_per_over = 10 if total_balls in (100,) else 6
+    total_sets = total_balls // balls_per_over
+
+    # Use a REAL phase-aware bowling sequence (who bowls when, based on
+    # actual historical powerplay/middle/death tendencies) if provided,
+    # or build one on the fly as a fallback for direct calls to this
+    # function (run_monte_carlo normally precomputes and passes it in
+    # once per match, not per-ball, for performance).
+    if bowling_sequence is None and db_path:
+        bowling_sequence = build_realistic_bowling_sequence(
+            bowling.bowlers, total_sets=total_sets, db_path=db_path
+        )
+
+    if bowling_sequence:
+        set_idx = 0
+        current_bowler = bowling_sequence[0] if bowling_sequence else bowling.bowlers[0]
+    else:
+        # Fallback: original round-robin behaviour
+        bowlers_available = [b for b in bowling.bowlers if b.max_overs > 0]
+        if not bowlers_available:
+            bowlers_available = bowling.bowlers[:5]
+        bowler_idx = 0
+        current_bowler = bowlers_available[0]
 
     while result.balls_faced < total_balls and result.wickets < 10:
         if striker_idx >= len(batting.batters):
@@ -502,12 +520,17 @@ def simulate_innings(
         batter = batting.batters[striker_idx]
 
         if balls_in_over == 0:
-            attempts = 0
-            while bowlers_available[bowler_idx % len(bowlers_available)].overs_bowled >= \
-                  bowlers_available[bowler_idx % len(bowlers_available)].max_overs and attempts < len(bowlers_available):
-                bowler_idx += 1
-                attempts += 1
-        current_bowler = bowlers_available[bowler_idx % len(bowlers_available)]
+            if bowling_sequence:
+                set_idx = result.balls_faced // balls_per_over
+                if set_idx < len(bowling_sequence):
+                    current_bowler = bowling_sequence[set_idx]
+            else:
+                attempts = 0
+                while bowlers_available[bowler_idx % len(bowlers_available)].overs_bowled >= \
+                      bowlers_available[bowler_idx % len(bowlers_available)].max_overs and attempts < len(bowlers_available):
+                    bowler_idx += 1
+                    attempts += 1
+                current_bowler = bowlers_available[bowler_idx % len(bowlers_available)]
 
         runs, is_wicket = simulate_ball(batter, current_bowler, rng, venue_scale=venue_scale, matchup_cache=matchup_cache)
 
@@ -536,9 +559,9 @@ def simulate_innings(
 
         if balls_in_over >= balls_per_over:
             balls_in_over = 0
-            over_num += 1
             current_bowler.overs_bowled += 1
-            bowler_idx += 1
+            if not bowling_sequence:
+                bowler_idx += 1
             # End of over -> ends change, non-striker becomes striker
             if striker_idx < len(batting.batters) and non_striker_idx < len(batting.batters):
                 striker_idx, non_striker_idx = non_striker_idx, striker_idx
@@ -565,13 +588,19 @@ def run_match(
     rng: random.Random = None,
     venue_scale: float = 1.0,
     matchup_cache: dict = None,
+    team_a_bowling_seq: list = None,
+    team_b_bowling_seq: list = None,
 ) -> dict:
     """Simulate one full match (2 innings). Returns result dict."""
     rng = rng or random.Random()
 
-    inn1 = simulate_innings(team_a, team_b, total_balls, rng=rng, venue_scale=venue_scale, matchup_cache=matchup_cache)
+    # team_a bats first, bowled at by team_b's sequence; then team_b
+    # chases, bowled at by team_a's sequence
+    inn1 = simulate_innings(team_a, team_b, total_balls, rng=rng, venue_scale=venue_scale,
+                             matchup_cache=matchup_cache, bowling_sequence=team_b_bowling_seq)
     target = inn1.runs + 1
-    inn2 = simulate_innings(team_b, team_a, total_balls, target=target, rng=rng, venue_scale=venue_scale, matchup_cache=matchup_cache)
+    inn2 = simulate_innings(team_b, team_a, total_balls, target=target, rng=rng, venue_scale=venue_scale,
+                             matchup_cache=matchup_cache, bowling_sequence=team_a_bowling_seq)
 
     if inn2.runs >= target:
         winner = team_b.name
@@ -613,6 +642,14 @@ def run_monte_carlo(
 
     matchup_cache = build_matchup_cache(team_a, team_b, db_path) if use_real_matchups else {}
 
+    # Precompute REAL phase-aware bowling sequences ONCE (not per
+    # simulation -- this is the expensive DB-backed step, same pattern
+    # as matchup_cache above).
+    balls_per_over = 10 if total_balls in (100,) else 6
+    total_sets = total_balls // balls_per_over
+    team_a_bowling_seq = build_realistic_bowling_sequence(team_a.bowlers, total_sets, db_path)
+    team_b_bowling_seq = build_realistic_bowling_sequence(team_b.bowlers, total_sets, db_path)
+
     rng = random.Random(seed)
     a_wins = 0
     b_wins = 0
@@ -621,7 +658,10 @@ def run_monte_carlo(
     b_scores = []
 
     for i in range(n_sims):
-        result = run_match(team_a, team_b, total_balls, rng=rng, venue_scale=venue_scale, matchup_cache=matchup_cache)
+        result = run_match(team_a, team_b, total_balls, rng=rng, venue_scale=venue_scale,
+                            matchup_cache=matchup_cache,
+                            team_a_bowling_seq=team_a_bowling_seq,
+                            team_b_bowling_seq=team_b_bowling_seq)
         a_scores.append(result["team_a_score"])
         b_scores.append(result["team_b_score"])
         if result["winner"] == team_a.name:
@@ -653,6 +693,8 @@ def run_monte_carlo(
         "venue_real_chase_pct": venue_info.get("chase_win_pct"),
         "venue_sample_matches": venue_info.get("matches", 0),
         "real_matchup_pairs": len(matchup_cache),
+        "real_phase_bowlers": sum(1 for b in (team_a.bowlers + team_b.bowlers)
+                                   if b.cricsheet_name and get_bowler_phase_profile(b.cricsheet_name, db_path)),
         "team_b": team_b.name,
         "team_a_win_pct": round(a_wins / n_sims * 100, 1),
         "team_b_win_pct": round(b_wins / n_sims * 100, 1),
