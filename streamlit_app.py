@@ -147,6 +147,7 @@ with st.sidebar:
         "🔴 Match dashboard",
         "👁 In-play engine",
         "👤 Player analytics",
+        "🎲 Match Simulator",
         "🎯 Ball-by-Ball Fetcher",
         "📅 Calendar & Targets",
         "📈 Bankroll tracker",
@@ -2189,6 +2190,184 @@ elif page == "👤 Player analytics":
 # ══════════════════════════════════════════════════════════════════════════
 # PAGE: BANKROLL TRACKER
 # ══════════════════════════════════════════════════════════════════════════
+
+
+
+elif page == "🎲 Match Simulator":
+    st.title("🎲 Match Simulator")
+    st.caption("Stage 1 — Monte Carlo simulation from career stats already in the player database. "
+               "No live data, no odds, no ESPN — pure first-principles simulation.")
+    st.divider()
+
+    sys.path.insert(0, os.path.join(ROOT, "simulator"))
+    sys.path.insert(0, os.path.join(ROOT, "player_engine"))
+
+    PDB = os.path.join(ROOT, "db", "player_engine.db")
+
+    # ── Team selection ───────────────────────────────────────
+    conn_sim = sqlite3.connect(PDB)
+    conn_sim.row_factory = sqlite3.Row
+    teams_raw = conn_sim.execute("""
+        SELECT DISTINCT current_franchise AS team FROM players WHERE current_franchise IS NOT NULL
+        UNION
+        SELECT DISTINCT nationality AS team FROM players WHERE nationality IS NOT NULL
+        ORDER BY team
+    """).fetchall()
+    conn_sim.close()
+    team_names = [t["team"] for t in teams_raw if t["team"]]
+
+    sc1, sc2, sc3 = st.columns([2, 2, 1])
+    with sc1:
+        team_a_name = st.selectbox("Team A (bats first)", team_names,
+                                     index=team_names.index("MI London") if "MI London" in team_names else 0,
+                                     key="sim_ta")
+    with sc2:
+        default_b = "Manchester Super Giants" if "Manchester Super Giants" in team_names else (team_names[1] if len(team_names)>1 else team_names[0])
+        team_b_name = st.selectbox("Team B (chases)", team_names,
+                                     index=team_names.index(default_b),
+                                     key="sim_tb")
+    with sc3:
+        fmt_choice = st.selectbox("Format", ["T20 (120 balls)", "100-ball (100 balls)"], key="sim_fmt")
+        total_balls = 100 if "100" in fmt_choice else 120
+
+    # ── Venue selector ────────────────────────────────────────
+    sys.path.insert(0, os.path.join(ROOT, "simulator"))
+    from match_simulator import VENUE_STATS
+
+    venue_options = ["No venue adjustment (league average)"] + [
+        f"{v['name']}" for v in VENUE_STATS.values()
+    ]
+    venue_ids = [""] + list(VENUE_STATS.keys())
+    venue_choice_idx = st.selectbox(
+        "Venue", range(len(venue_options)),
+        format_func=lambda i: venue_options[i], key="sim_venue"
+    )
+    venue_id = venue_ids[venue_choice_idx]
+
+    if venue_id:
+        vinfo = VENUE_STATS[venue_id]
+        tier = vinfo.get('scoring_tier', 'Average')
+        tier_icon = {"High-scoring": "🔴", "Average": "🟡", "Low-scoring": "🔵"}.get(tier, "⚪")
+        st.caption(f"📊 {tier_icon} **{tier}** ground · Real Hundred avg 1st-innings: {vinfo['avg_first_innings_100b']} "
+                   f"(from {vinfo.get('matches',0)} matches) · "
+                   f"Chasing team wins {vinfo['chase_win_pct']}% of the time historically")
+
+    n_sims = st.slider("Number of simulations", 500, 5000, 2000, step=500, key="sim_n")
+
+    # ── Optional: paste confirmed playing XI ────────────────
+    st.divider()
+    use_xi = st.checkbox("Use confirmed playing XI instead of auto-picked top 11", key="sim_use_xi")
+
+    xi_a_text, xi_b_text = "", ""
+    if use_xi:
+        st.caption("Paste the XI for each team — messy copy-paste from ESPNcricinfo is fine "
+                   "(numbering, (c)/(wk) markers, extra page text). The parser extracts real "
+                   "player names automatically and shows what it kept vs discarded.")
+        xc1, xc2 = st.columns(2)
+        with xc1:
+            xi_a_text = st.text_area(f"{team_a_name} XI", height=220, key="sim_xi_a",
+                                       placeholder="Paste straight from ESPNcricinfo, e.g.:\n"
+                                                    "1 Jason Roy\n2 James Vince (c)\n3 Will Jacks\n...")
+        with xc2:
+            xi_b_text = st.text_area(f"{team_b_name} XI", height=220, key="sim_xi_b",
+                                       placeholder="Paste straight from ESPNcricinfo, e.g.:\n"
+                                                    "1 Jos Buttler (wk)\n2 Aiden Markram (c)\n...")
+
+    if st.button("🎲 Run simulation", type="primary", key="sim_run_btn"):
+        if team_a_name == team_b_name:
+            st.warning("Pick two different teams")
+        else:
+            from match_simulator import build_lineup_from_db, build_lineup_from_xi, run_monte_carlo, parse_pasted_xi_text
+
+            xi_log_a, xi_log_b = [], []
+
+            with st.spinner(f"Building lineups and running {n_sims:,} simulations..."):
+                if use_xi and xi_a_text.strip() and xi_b_text.strip():
+                    # Smart-parse messy pasted text -> clean matched names
+                    names_a, parse_log_a = parse_pasted_xi_text(xi_a_text, db_path=PDB)
+                    names_b, parse_log_b = parse_pasted_xi_text(xi_b_text, db_path=PDB)
+                    lineup_a, xi_log_a = build_lineup_from_xi(team_a_name, names_a, db_path=PDB)
+                    lineup_b, xi_log_b = build_lineup_from_xi(team_b_name, names_b, db_path=PDB)
+                    # Prepend parse log so the user sees extraction + matching together
+                    xi_log_a = parse_log_a + ["--- matched to lineup ---"] + xi_log_a
+                    xi_log_b = parse_log_b + ["--- matched to lineup ---"] + xi_log_b
+                else:
+                    lineup_a = build_lineup_from_db(team_a_name, db_path=PDB)
+                    lineup_b = build_lineup_from_db(team_b_name, db_path=PDB)
+
+                result = run_monte_carlo(lineup_a, lineup_b, total_balls=total_balls,
+                                          n_sims=n_sims, venue_id=venue_id, db_path=PDB)
+
+            st.session_state["last_sim_result"] = result
+            st.session_state["last_sim_lineups"] = (lineup_a, lineup_b)
+            st.session_state["last_sim_xi_log"] = (xi_log_a, xi_log_b)
+
+    # ── Show XI matching log if used ────────────────────────
+    if st.session_state.get("last_sim_xi_log"):
+        log_a, log_b = st.session_state["last_sim_xi_log"]
+        if log_a or log_b:
+            with st.expander("🔍 Playing XI matching log", expanded=any(l.startswith("⚠") for l in log_a+log_b)):
+                lc1, lc2 = st.columns(2)
+                with lc1:
+                    for line in log_a:
+                        st.text(line)
+                with lc2:
+                    for line in log_b:
+                        st.text(line)
+
+    # ── Show results ─────────────────────────────────────────
+    if "last_sim_result" in st.session_state:
+        r = st.session_state["last_sim_result"]
+
+        st.divider()
+        if r.get("venue_name"):
+            tier = r.get('venue_scoring_tier', '')
+            tier_icon = {"High-scoring": "🔴", "Average": "🟡", "Low-scoring": "🔵"}.get(tier, "")
+            st.caption(f"📍 Venue: {r['venue_name']} {tier_icon} {tier} "
+                       f"(real avg {r.get('venue_real_avg','?')}, scale ×{r['venue_scale']})")
+        if r.get("real_matchup_pairs"):
+            st.caption(f"🎯 {r['real_matchup_pairs']} real batter-vs-bowler pairs used from ball-by-ball history")
+
+        rc1, rc2 = st.columns(2)
+        with rc1:
+            st.metric(r["team_a"], f"{r['team_a_win_pct']}%",
+                      help="Win probability")
+            st.caption(f"Median score: {r['team_a_score_median']} "
+                       f"(range {r['team_a_score_p10']}–{r['team_a_score_p90']})")
+        with rc2:
+            st.metric(r["team_b"], f"{r['team_b_win_pct']}%",
+                      help="Win probability")
+            st.caption(f"Median score: {r['team_b_score_median']} "
+                       f"(range {r['team_b_score_p10']}–{r['team_b_score_p90']})")
+
+        if r["tie_pct"] > 0.5:
+            st.caption(f"Tie probability: {r['tie_pct']}%")
+
+        st.progress(r["team_a_win_pct"] / 100,
+                    text=f"{r['team_a']} {r['team_a_win_pct']}% — {r['team_b']} {r['team_b_win_pct']}%")
+
+        st.caption(f"Based on {r['n_sims']:,} simulated matches using career T20 stats "
+                   "(average, strike rate, bowling economy, wicket rate) + current form score.")
+
+        # Show lineups used
+        if "last_sim_lineups" in st.session_state:
+            la, lb = st.session_state["last_sim_lineups"]
+            with st.expander("📋 Lineups used in simulation"):
+                lc1, lc2 = st.columns(2)
+                with lc1:
+                    st.markdown(f"**{la.name}**")
+                    for b in la.batters:
+                        st.text(f"{b.position}. {b.name}  (avg {b.avg:.0f}, SR {b.sr:.0f}, form {b.form:.1f})")
+                with lc2:
+                    st.markdown(f"**{lb.name}**")
+                    for b in lb.batters:
+                        st.text(f"{b.position}. {b.name}  (avg {b.avg:.0f}, SR {b.sr:.0f}, form {b.form:.1f})")
+
+    st.divider()
+    st.caption("⚠️ Model uses career stats + venue scoring scale (from public ground records) "
+               "+ a simplified batting/bowling-style matchup heuristic. Still no phase-specific "
+               "(powerplay/middle/death) rates or real batter-vs-bowler history — that needs "
+               "ball-by-ball data, which isn't loaded yet.")
 
 
 elif page == "🎯 Ball-by-Ball Fetcher":
